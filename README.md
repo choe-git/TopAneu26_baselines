@@ -16,25 +16,30 @@ TopAneu_baseline/
 │   ├── prepare_dataset.py
 │   ├── preprocess.sh
 │   ├── train.py
+│   ├── trainer.py
+│   ├── evaluate.py
 │   ├── predict.py
 │   └── locations_from_masks.py
 └── requirements.txt
 ```
 
-The preparation command creates this separate data directory:
+The preparation command creates a separate run directory outside this repository:
 
 ```text
-topaneu_data/
-└── nnUNet_raw/Dataset501_TopAneu/
-    ├── imagesTr/
-    ├── labelsTr/
-    ├── imagesTs/
-    ├── labelsTs/
-    ├── split.csv
-    └── dataset.json
+DATA_ROOT/
+├── nnUNet_raw/Dataset501_TopAneu/
+│   ├── imagesTr/
+│   ├── labelsTr/
+│   ├── imagesTs/
+│   ├── labelsTs/
+│   ├── split.csv
+│   └── dataset.json
+├── nnUNet_preprocessed/
+├── nnUNet_results/
+└── tensorboard/
 ```
 
-`split.csv` is the single source of truth for the split. Train and validation cases are placed in `imagesTr`/`labelsTr`, because nnU-Net preprocesses both before training. Test cases are isolated in `imagesTs`/`labelsTs` and are never used for preprocessing or training. Files are hard-linked when possible and copied only if links are unavailable.
+`split.csv` is the single source of truth for the split. Train and validation cases are placed in `imagesTr`/`labelsTr`, because nnU-Net preprocesses both before training. Test cases are isolated in `imagesTs`/`labelsTs` and are not used for planning, offline preprocessing, or weight updates; nnU-Net preprocesses them only when evaluation inference runs. Files are hard-linked when possible and copied only if links are unavailable.
 
 The split is patient-level and deterministic:
 
@@ -52,23 +57,45 @@ Use a clean Python environment with a CUDA-compatible PyTorch install, then:
 python -m pip install -r requirements.txt
 ```
 
+## Server paths
+
+Run every command from:
+
+```bash
+cd /home/introai30/.apni/users/yhchoe/projects/5_TopAneu/TopAneu_baseline
+```
+
+The paths in the server layout are:
+
+```bash
+SOURCE_ROOT=/home/introai30/.apni/users/yhchoe/projects/resources/topaneu_release
+DATA_ROOT=/home/introai30/.apni/users/yhchoe/projects/runs/5_TopAneu/baseline/nnunet_v2
+```
+
+`SOURCE_ROOT` is read-only input. All arranged data, preprocessing files, checkpoints, predictions, metrics, and TensorBoard events are written below `DATA_ROOT`. Use a new `DATA_ROOT` for a new experiment.
+
 ## Prepare once
 
 Run the commands from the `TopAneu_baseline` directory:
 
 ```bash
 python scripts/prepare_dataset.py \
-  --source /path/to/topaneu_release \
+  --source "$SOURCE_ROOT" \
   --split-csv split.csv \
-  --output topaneu_data
+  --output "$DATA_ROOT"
 ```
 
 This step only arranges the original files in nnU-Net format. It does not resample, normalize, or train anything.
 
+- `--source`: original `topaneu_release` directory
+- `--output`: separate run directory; no files are written into the source data
+- `--split-csv`: CSV containing exactly one `1` among `train`, `val`, and `test` per case
+- `--overwrite`: rebuild only `nnUNet_raw/Dataset501_TopAneu`; normally use a new `DATA_ROOT` instead
+
 ## Preprocess once
 
 ```bash
-bash scripts/preprocess.sh topaneu_data
+bash scripts/preprocess.sh "$DATA_ROOT"
 ```
 
 This runs only nnU-Net planning and preprocessing. The generic channel name `angiography` intentionally selects per-case z-score normalization, which is appropriate for a single model trained on both CTA and MRA.
@@ -77,11 +104,34 @@ This runs only nnU-Net planning and preprocessing. The generic channel name `ang
 
 ```bash
 python scripts/train.py \
-  --data-root topaneu_data \
-  --split-csv split.csv
+  --data-root "$DATA_ROOT" \
+  --split-csv split.csv \
+  --device cuda
 ```
 
-`train.py` converts the CSV train/validation rows to nnU-Net's `splits_final.json` and trains fold 0 using exactly that split. The test rows are checked against `imagesTs`/`labelsTs` but are not exposed to training. To resume an interrupted training run, add `--continue-training`.
+`train.py` converts the CSV train/validation rows to nnU-Net's `splits_final.json` and trains using exactly that split. The test rows are checked against `imagesTs`/`labelsTs` and are used only for evaluation. To resume an interrupted training run, add `--continue-training`.
+
+- `--data-root`: the same `DATA_ROOT` used for preparation and preprocessing
+- `--split-csv`: split definition; defaults to the repository's `split.csv`
+- `--continue-training`: resume `checkpoint_latest.pth`
+- `--device`: `cuda` for the server, or `cpu` for diagnostics only
+- `--smoke-test`: 10 epochs with one train/validation iteration; never use for the full experiment
+
+Training uses the nnU-Net v2 defaults for 1,000 epochs and 250 training iterations per epoch. Train loss is written every epoch. Every 10 epochs, the trainer computes validation loss and runs full-volume inference on the validation and test sets. TensorBoard records:
+
+- `loss/train` every epoch
+- `loss/val` every 10 epochs
+- `val/task1/*`, `val/task2/*`, `test/task1/*`, and `test/task2/*` every 10 epochs
+
+Task 1 metrics are Precision, Recall, and MCC. Task 2 metrics are Precision, Recall, MCC, Dice, volumetric similarity, and normalized HD95, using the official 52-class TopAneu aggregation ([Task 1 evaluator](https://github.com/Bangulli/TopAneu-26/blob/main/eval/task1/evaluate.py), [Task 2 evaluator](https://github.com/Bangulli/TopAneu-26/blob/main/eval/task2/evaluate.py)). Per-class values are saved under `evaluation/metrics/epoch_XXXX/`; TensorBoard and the terminal show the class averages. The latest validation and test masks are overwritten in fixed folders, and the final test averages are printed when training ends.
+
+To view the logs:
+
+```bash
+tensorboard --logdir "$DATA_ROOT/tensorboard"
+```
+
+For a plumbing-only smoke test, prepare a separate tiny dataset and add `--smoke-test`. This keeps the same model and preprocessing but runs 10 epochs with one train and one validation iteration per epoch. Smoke inference disables mirroring and uses non-overlapping tiles; normal training keeps nnU-Net's default inference settings. If one source case is aliased across all three splits, its metrics only test the pipeline and must not be reported as model performance. Use `--device cpu` only when CUDA is unavailable; it is much slower.
 
 ## Predict both tasks
 
@@ -89,8 +139,8 @@ Input files must use nnU-Net single-channel names such as `case_001_0000.nii.gz`
 
 ```bash
 python scripts/predict.py \
-  --images topaneu_data/nnUNet_raw/Dataset501_TopAneu/imagesTs \
-  --model topaneu_data/nnUNet_results/Dataset501_TopAneu/nnUNetTrainer__nnUNetPlans__3d_fullres \
+  --images "$DATA_ROOT/nnUNet_raw/Dataset501_TopAneu/imagesTs" \
+  --model "$DATA_ROOT/nnUNet_results/Dataset501_TopAneu/nnUNetTrainer__nnUNetPlans__3d_fullres" \
   --output /path/to/predictions
 ```
 

@@ -1,1 +1,2 @@
 nnunetv2==2.8.1
+tensorboard==2.20.0

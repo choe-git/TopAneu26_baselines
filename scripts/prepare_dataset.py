@@ -16,11 +16,14 @@ DEFAULT_SPLIT = Path(__file__).resolve().parents[1] / "split.csv"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--split-csv", type=Path, default=DEFAULT_SPLIT)
-    parser.add_argument("--overwrite", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="Arrange TopAneu files in the minimal nnU-Net v2 format.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--source", type=Path, required=True, help="TopAneu release directory")
+    parser.add_argument("--output", type=Path, required=True, help="Separate run/data directory")
+    parser.add_argument("--split-csv", type=Path, default=DEFAULT_SPLIT, help="Train/val/test split")
+    parser.add_argument("--overwrite", action="store_true", help="Rebuild only Dataset501_TopAneu")
     return parser.parse_args()
 
 
