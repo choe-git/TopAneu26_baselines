@@ -12,6 +12,7 @@ import torch
 from nnunetv2.run.run_training import run_training
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from tqdm.auto import tqdm
 
 from topaneu_baseline.challenge_metrics import evaluate_prediction_masks
 from topaneu_baseline.tensorboard_logging import challenge_metric_scalars
@@ -62,33 +63,80 @@ def install_tensorboard_hooks() -> None:
 
     def run_training_with_interval_validation(self: nnUNetTrainer) -> None:
         interval = max(1, int(os.environ.get("TOPANEU_EVAL_EVERY", "10")))
+        show_progress = self.local_rank == 0 and os.environ.get("TOPANEU_DISABLE_TQDM", "0") != "1"
         self.on_train_start()
-        for epoch in range(self.current_epoch, self.num_epochs):
-            self.on_epoch_start()
-            self.on_train_epoch_start()
-            train_outputs = [self.train_step(next(self.dataloader_train)) for _ in range(self.num_iterations_per_epoch)]
-            self.on_train_epoch_end(train_outputs)
+        with tqdm(
+            range(self.current_epoch, self.num_epochs),
+            total=self.num_epochs,
+            initial=self.current_epoch,
+            desc=f"nnU-Net fold {self.fold}",
+            unit="epoch",
+            dynamic_ncols=True,
+            disable=not show_progress,
+        ) as epoch_progress:
+            for epoch in epoch_progress:
+                self.on_epoch_start()
+                self.on_train_epoch_start()
+                train_outputs = []
+                running_loss = 0.0
+                with tqdm(
+                    range(self.num_iterations_per_epoch),
+                    desc=f"Epoch {epoch + 1}/{self.num_epochs} train",
+                    unit="batch",
+                    leave=False,
+                    dynamic_ncols=True,
+                    disable=not show_progress,
+                ) as train_progress:
+                    for batch_id in train_progress:
+                        output = self.train_step(next(self.dataloader_train))
+                        train_outputs.append(output)
+                        loss = _finite(output.get("loss"))
+                        if loss is not None:
+                            running_loss += loss
+                            if (batch_id + 1) % 10 == 0 or batch_id + 1 == self.num_iterations_per_epoch:
+                                train_progress.set_postfix(loss=f"{running_loss / (batch_id + 1):.4f}")
+                self.on_train_epoch_end(train_outputs)
 
-            # Epoch 1 establishes values required by nnU-Net's progress/checkpoint logger;
-            # subsequent validation passes happen on epochs N, 2N, ... and the final epoch.
-            run_validation = epoch == 0 or (epoch + 1) % interval == 0 or epoch + 1 == self.num_epochs
-            self._topaneu_validation_ran = run_validation
-            self._topaneu_validation_log = (epoch + 1) % interval == 0 or epoch + 1 == self.num_epochs
-            if run_validation:
-                with torch.no_grad():
-                    self.on_validation_epoch_start()
-                    val_outputs = [
-                        self.validation_step(next(self.dataloader_val))
-                        for _ in range(self.num_val_iterations_per_epoch)
-                    ]
-                    self.on_validation_epoch_end(val_outputs)
-            else:
-                # nnU-Net's stock on_epoch_end expects one value at every index. Carrying
-                # the last observation preserves checkpoint/resume compatibility without
-                # pretending that a new validation pass ran.
-                for key in ("val_losses", "mean_fg_dice", "dice_per_class_or_region"):
-                    self.logger.log(key, self.logger.get_value(key, step=-1), self.current_epoch)
-            self.on_epoch_end()
+                # Epoch 1 establishes values required by nnU-Net's progress/checkpoint logger;
+                # subsequent validation passes happen on epochs N, 2N, ... and the final epoch.
+                run_validation = epoch == 0 or (epoch + 1) % interval == 0 or epoch + 1 == self.num_epochs
+                self._topaneu_validation_ran = run_validation
+                self._topaneu_validation_log = (epoch + 1) % interval == 0 or epoch + 1 == self.num_epochs
+                if run_validation:
+                    with torch.no_grad():
+                        self.on_validation_epoch_start()
+                        val_outputs = []
+                        with tqdm(
+                            range(self.num_val_iterations_per_epoch),
+                            desc=f"Epoch {epoch + 1}/{self.num_epochs} validation",
+                            unit="batch",
+                            leave=False,
+                            dynamic_ncols=True,
+                            disable=not show_progress,
+                        ) as validation_progress:
+                            for _ in validation_progress:
+                                val_outputs.append(self.validation_step(next(self.dataloader_val)))
+                        self.on_validation_epoch_end(val_outputs)
+                else:
+                    # nnU-Net's stock on_epoch_end expects one value at every index. Carrying
+                    # the last observation preserves checkpoint/resume compatibility without
+                    # pretending that a new validation pass ran.
+                    for key in ("val_losses", "mean_fg_dice", "dice_per_class_or_region"):
+                        self.logger.log(key, self.logger.get_value(key, step=-1), self.current_epoch)
+                self.on_epoch_end()
+
+                postfix: dict[str, str] = {}
+                train_loss = _finite(self.logger.get_value("train_losses", step=-1))
+                if train_loss is not None:
+                    postfix["train_loss"] = f"{train_loss:.4f}"
+                if self._topaneu_validation_log:
+                    val_loss = _finite(self.logger.get_value("val_losses", step=-1))
+                    val_dice = _finite(self.logger.get_value("mean_fg_dice", step=-1))
+                    if val_loss is not None:
+                        postfix["val_loss"] = f"{val_loss:.4f}"
+                    if val_dice is not None:
+                        postfix["val_dice"] = f"{val_dice:.4f}"
+                epoch_progress.set_postfix(postfix)
         self.on_train_end()
 
     def log_periodic_monitor_test(self: nnUNetTrainer, writer: Any, step: int) -> None:
@@ -112,7 +160,7 @@ def install_tensorboard_hooks() -> None:
                 device=self.device,
                 verbose=False,
                 verbose_preprocessing=False,
-                allow_tqdm=False,
+                allow_tqdm=self.local_rank == 0 and os.environ.get("TOPANEU_DISABLE_TQDM", "0") != "1",
             )
             predictor.manual_initialization(
                 self.network,

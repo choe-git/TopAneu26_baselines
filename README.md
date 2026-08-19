@@ -6,6 +6,7 @@ Task 1과 Task 2를 하나의 `nnU-Net v2 Residual Encoder M, 3d_fullres` 모델
 - Task 1: Task 2 mask에 존재하는 location label을 JSON integer list로 변환
 - split: 환자 그룹 기준 train 283 / validation 65 / test 68
 - TensorBoard: train loss는 매 epoch, validation과 monitor-test는 10 epoch마다
+- terminal: epoch/train batch/validation 진행률을 tqdm progress bar로 표시
 - final test: 학습 종료 후 challenge metric과 Task 1/2 결과 자동 생성
 - run folder: `YYYYMMDD_HHMM` 이름으로 자동 생성
 
