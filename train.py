@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -40,7 +41,16 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_LAYOUT["data_root"])
-    parser.add_argument("--workspace", type=Path, default=DEFAULT_LAYOUT["workspace"])
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=DEFAULT_LAYOUT["workspace"],
+        help="Base output directory; a YYYYMMDD_HHMM run directory is added automatically",
+    )
+    parser.add_argument(
+        "--run-name",
+        help="Override the automatic YYYYMMDD_HHMM run name; useful for selecting a specific run",
+    )
     parser.add_argument("--dataset-id", type=int, default=DEFAULT_DATASET_ID)
     parser.add_argument("--dataset-name", default=DEFAULT_DATASET_NAME)
     parser.add_argument("--split-mode", choices=("holdout", "crossval"), default="holdout")
@@ -92,6 +102,34 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--verify-mask-values", action="store_true", help="Read every mask during data inspection")
     return parser.parse_args()
+
+
+def resolve_run_workspace(base: Path, run_name: str | None, *, reuse_latest: bool) -> Path:
+    base = base.resolve()
+    if run_name is not None:
+        if Path(run_name).name != run_name or not all(char.isalnum() or char in "._-" for char in run_name):
+            raise ValueError("--run-name must be a single directory name containing letters, numbers, '.', '_' or '-'")
+        return base / run_name
+
+    timestamped = sorted(
+        path
+        for path in base.glob("????????_????*")
+        if path.is_dir() and path.name[:8].isdigit() and path.name[9:13].isdigit()
+    ) if base.is_dir() else []
+    if reuse_latest:
+        if not timestamped:
+            raise FileNotFoundError(
+                f"No timestamped run exists under {base}. Specify the run explicitly with --run-name."
+            )
+        return timestamped[-1]
+
+    stem = datetime.now().strftime("%Y%m%d_%H%M")
+    candidate = base / stem
+    counter = 2
+    while candidate.exists():
+        candidate = base / f"{stem}_{counter:02d}"
+        counter += 1
+    return candidate
 
 
 def run_command(command: Sequence[str], env: dict[str, str], log: list[list[str]]) -> None:
@@ -194,7 +232,8 @@ def predict_folder(
 
 def main() -> None:
     args = parse_args()
-    args.workspace = args.workspace.resolve()
+    reuse_latest = args.resume or args.skip_prepare or args.skip_preprocess or args.skip_train
+    args.workspace = resolve_run_workspace(args.workspace, args.run_name, reuse_latest=reuse_latest)
     args.data_root = args.data_root.resolve()
     if args.eval_every < 1:
         raise ValueError("--eval-every must be at least 1")
@@ -202,6 +241,7 @@ def main() -> None:
     paths = nnunet_paths(args.workspace)
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
+    print(f"Run workspace: {args.workspace}", flush=True)
     env = os.environ.copy()
     env.update(nnunet_environment(args.workspace))
     tensorboard_root = args.workspace / "tensorboard"

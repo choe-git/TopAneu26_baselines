@@ -7,6 +7,7 @@ Task 1과 Task 2를 하나의 `nnU-Net v2 Residual Encoder M, 3d_fullres` 모델
 - split: 환자 그룹 기준 train 283 / validation 65 / test 68
 - TensorBoard: train loss는 매 epoch, validation과 monitor-test는 10 epoch마다
 - final test: 학습 종료 후 challenge metric과 Task 1/2 결과 자동 생성
+- run folder: `YYYYMMDD_HHMM` 이름으로 자동 생성
 
 ## 로컬 D 드라이브 구조
 
@@ -24,7 +25,7 @@ topaneu_release/
     └── runs/                      # 자동 생성, Git 제외
 ```
 
-서버의 `<repo>/projects/5_TopAneu`, `<repo>/resources/topaneu_release`,
+서버의 `<repo>/projects/5_TopAneu/topaneu_baseline`, `<repo>/resources/topaneu_release`,
 `<repo>/runs/5_TopAneu` 구조도 자동 인식합니다. 다른 배치에서는 `--data-root`, `--workspace`로 지정합니다.
 
 ## 설치와 실행
@@ -47,6 +48,8 @@ eval interval = 10 epochs
 ```
 
 평가 주기는 `--eval-every N`으로 바꿀 수 있습니다. 중단된 학습은 `--resume`으로 이어서 실행합니다.
+새 학습은 `runs/5_TopAneu/YYYYMMDD_HHMM` 폴더를 자동 생성합니다. 같은 분에 두 번 시작하면 `_02`, `_03`을
+붙입니다. `--resume`은 가장 최근 run을 자동 선택하며, 특정 run은 `--run-name 20260819_1630`으로 지정합니다.
 
 ## split.csv
 
@@ -61,7 +64,7 @@ eval interval = 10 epochs
 ## TensorBoard
 
 ```bash
-tensorboard --logdir runs/tensorboard --port 6006
+tensorboard --logdir ../../../runs/5_TopAneu --port 6006
 ```
 
 주요 tag:
@@ -81,11 +84,12 @@ test/final/macro/*                            # 최종 1회
 ## 결과
 
 ```text
-runs/
-├── evaluation/{validation,test}/
-├── predictions/internal_test_outputs/{task1,task2}/
-├── tensorboard/
-├── nnUNet_raw/
-├── nnUNet_preprocessed/
-└── nnUNet_results/
+runs/5_TopAneu/
+└── YYYYMMDD_HHMM/
+    ├── evaluation/{validation,test}/
+    ├── predictions/internal_test_outputs/{task1,task2}/
+    ├── tensorboard/
+    ├── nnUNet_raw/
+    ├── nnUNet_preprocessed/
+    └── nnUNet_results/
 ```

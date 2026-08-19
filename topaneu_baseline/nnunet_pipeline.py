@@ -28,14 +28,14 @@ DEFAULT_TRAINER = "nnUNetTrainer"
 def repository_layout(project_dir: str | Path) -> dict[str, Path]:
     """Resolve either the server tree or this repository beside an unpacked dataset."""
     project_dir = Path(project_dir).resolve()
-    if project_dir.parent.name == "projects":
-        repository_root = project_dir.parent.parent
-        data_root = repository_root / "resources" / "topaneu_release"
-        workspace = repository_root / "runs" / "5_TopAneu"
-    elif (project_dir.parent / "images").is_dir() and (project_dir.parent / "location_masks").is_dir():
+    if (project_dir.parent / "images").is_dir() and (project_dir.parent / "location_masks").is_dir():
         repository_root = project_dir.parent
         data_root = repository_root
         workspace = project_dir / "runs"
+    elif projects_dir := next((parent for parent in project_dir.parents if parent.name == "projects"), None):
+        repository_root = projects_dir.parent
+        data_root = repository_root / "resources" / "topaneu_release"
+        workspace = repository_root / "runs" / "5_TopAneu"
     else:
         repository_root = project_dir.parent.parent
         data_root = repository_root / "resources" / "topaneu_release"
