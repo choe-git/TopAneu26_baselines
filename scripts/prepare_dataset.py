@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--source", type=Path, required=True, help="TopAneu release directory")
-    parser.add_argument("--output", type=Path, required=True, help="Separate run/data directory")
+    parser.add_argument("--output", type=Path, required=True, help="Timestamped experiment directory")
     parser.add_argument("--split-csv", type=Path, default=DEFAULT_SPLIT, help="Train/val/test split")
     parser.add_argument("--overwrite", action="store_true", help="Rebuild only Dataset501_TopAneu")
     return parser.parse_args()

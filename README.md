@@ -39,6 +39,17 @@ DATA_ROOT/
 └── tensorboard/
 ```
 
+On the server, `DATA_ROOT` is one timestamped experiment directory:
+
+```text
+runs/5_TopAneu/baseline/
+└── YYYYMMDD_HHMMSS/
+    ├── nnUNet_raw/
+    ├── nnUNet_preprocessed/
+    ├── nnUNet_results/
+    └── tensorboard/
+```
+
 `split.csv` is the single source of truth for the split. Train and validation cases are placed in `imagesTr`/`labelsTr`, because nnU-Net preprocesses both before training. Test cases are isolated in `imagesTs`/`labelsTs` and are not used for planning, offline preprocessing, or weight updates; nnU-Net preprocesses them only when evaluation inference runs. Files are hard-linked when possible and copied only if links are unavailable.
 
 The split is patient-level and deterministic:
@@ -69,10 +80,13 @@ The paths in the server layout are:
 
 ```bash
 SOURCE_ROOT=/home/introai30/.apni/users/yhchoe/projects/resources/topaneu_release
-DATA_ROOT=/home/introai30/.apni/users/yhchoe/projects/runs/5_TopAneu/baseline/nnunet_v2
+RUNS_ROOT=/home/introai30/.apni/users/yhchoe/projects/runs/5_TopAneu/baseline
+RUN_ID=$(date +%Y%m%d_%H%M%S)
+DATA_ROOT="$RUNS_ROOT/$RUN_ID"
+echo "$DATA_ROOT"
 ```
 
-`SOURCE_ROOT` is read-only input. All arranged data, preprocessing files, checkpoints, predictions, metrics, and TensorBoard events are written below `DATA_ROOT`. Use a new `DATA_ROOT` for a new experiment.
+Create `RUN_ID` only once per experiment and use the same `DATA_ROOT` for preparation, preprocessing, and training. `SOURCE_ROOT` is read-only input. All arranged data, preprocessing files, checkpoints, predictions, metrics, and TensorBoard events are written below the timestamped `DATA_ROOT`.
 
 ## Prepare once
 
@@ -88,7 +102,7 @@ python scripts/prepare_dataset.py \
 This step only arranges the original files in nnU-Net format. It does not resample, normalize, or train anything.
 
 - `--source`: original `topaneu_release` directory
-- `--output`: separate run directory; no files are written into the source data
+- `--output`: timestamped experiment directory; no files are written into the source data
 - `--split-csv`: CSV containing exactly one `1` among `train`, `val`, and `test` per case
 - `--overwrite`: rebuild only `nnUNet_raw/Dataset501_TopAneu`; normally use a new `DATA_ROOT` instead
 
@@ -111,7 +125,7 @@ python scripts/train.py \
 
 `train.py` converts the CSV train/validation rows to nnU-Net's `splits_final.json` and trains using exactly that split. The test rows are checked against `imagesTs`/`labelsTs` and are used only for evaluation. To resume an interrupted training run, add `--continue-training`.
 
-- `--data-root`: the same `DATA_ROOT` used for preparation and preprocessing
+- `--data-root`: the same timestamped `DATA_ROOT` used for preparation and preprocessing
 - `--split-csv`: split definition; defaults to the repository's `split.csv`
 - `--continue-training`: resume `checkpoint_latest.pth`
 - `--device`: `cuda` for the server, or `cpu` for diagnostics only

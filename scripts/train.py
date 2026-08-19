@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
         description="Train and evaluate the TopAneu nnU-Net v2 baseline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--data-root", type=Path, required=True, help="Prepared nnU-Net data/run directory")
+    parser.add_argument("--data-root", type=Path, required=True, help="Timestamped prepared experiment directory")
     parser.add_argument("--split-csv", type=Path, default=DEFAULT_SPLIT, help="Train/val/test split")
     parser.add_argument("--continue-training", action="store_true", help="Resume checkpoint_latest.pth")
     parser.add_argument("--smoke-test", action="store_true", help="Run the 10-epoch plumbing test")
@@ -74,6 +74,9 @@ def main() -> None:
     split_path = write_nnunet_split(split, paths["nnUNet_preprocessed"])
 
     os.environ.update({name: str(path) for name, path in paths.items()})
+    print(f"Run directory: {paths['nnUNet_results'].parent}")
+    print(f"Checkpoints/results: {paths['nnUNet_results']}")
+    print(f"TensorBoard: {paths['nnUNet_results'].parent / 'tensorboard'}")
     print(f"Using split: {split_path}")
 
     import torch
