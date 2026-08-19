@@ -88,6 +88,7 @@ def main() -> None:
 
     dataset = paths["nnUNet_preprocessed"] / f"Dataset{DATASET_ID}_{DATASET_NAME}"
     plans = json.loads((dataset / "nnUNetPlans.json").read_text())
+    plans["continue_training"] = args.continue_training
     dataset_json = json.loads((dataset / "dataset.json").read_text())
     trainer = nnUNetTrainer(plans, "3d_fullres", 0, dataset_json, torch.device(args.device))
     if args.smoke_test:
