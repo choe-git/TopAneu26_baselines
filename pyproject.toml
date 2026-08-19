@@ -1,0 +1,22 @@
+[project]
+name = "topaneu-baseline"
+version = "0.1.0"
+description = "Reproducible Task 1 and Task 2 baselines for TopAneu 2026"
+requires-python = ">=3.10"
+dependencies = [
+  "nibabel>=5.2",
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+  "scikit-learn>=1.4",
+  "scipy>=1.12",
+  "torch>=2.2",
+  "tqdm>=4.66",
+  "nnunetv2==2.8.1",
+  "tensorboard>=2.18",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.optional-dependencies]
+dev = ["pytest>=9"]

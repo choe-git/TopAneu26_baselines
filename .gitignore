@@ -1,0 +1,15 @@
+.venv/
+.uv-cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+runs/
+nnunet_workspace/
+artifacts/
+configs/
+resources/
+scripts/
+*.pt
+*.pth
+*.npz
+events.out.tfevents.*
