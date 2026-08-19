@@ -276,7 +276,8 @@ def main() -> None:
         for fold in training_folds:
             command = [
                 sys.executable,
-                str(PROJECT_DIR / "train_nnunet_tensorboard.py"),
+                "-m",
+                "topaneu_baseline.train_nnunet_tensorboard",
                 str(args.dataset_id),
                 args.configuration,
                 str(fold),

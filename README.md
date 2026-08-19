@@ -20,7 +20,7 @@ topaneu_release/
 ├── location_mapping.json
 └── baseline_work/                 # 이 저장소
     ├── split.csv                  # 직접 편집 가능
-    ├── run_strong_baseline.py
+    ├── train.py
     └── runs/                      # 자동 생성, Git 제외
 ```
 
@@ -33,7 +33,7 @@ topaneu_release/
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python run_strong_baseline.py --train-all --device cuda
+PYTHONPATH=$PWD python train.py --train-all --device cuda
 ```
 
 기본 모델과 실행 설정:
@@ -89,5 +89,3 @@ runs/
 ├── nnUNet_preprocessed/
 └── nnUNet_results/
 ```
-
-별도 변환과 평가는 `make_challenge_outputs.py`, `evaluate_challenge.py`를 사용할 수 있습니다.
