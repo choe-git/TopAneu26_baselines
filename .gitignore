@@ -1,19 +1,15 @@
-# Publish only the final training baseline.
+# Publish only the baseline source files.
 *
 
 !.gitignore
 !README.md
 !requirements.txt
 !split.csv
-!train.py
 
-!topaneu_baseline/
-topaneu_baseline/*
-!topaneu_baseline/__init__.py
-!topaneu_baseline/constants.py
-!topaneu_baseline/utils.py
-!topaneu_baseline/challenge_io.py
-!topaneu_baseline/challenge_metrics.py
-!topaneu_baseline/nnunet_pipeline.py
-!topaneu_baseline/tensorboard_logging.py
-!topaneu_baseline/train_nnunet_tensorboard.py
+!scripts/
+scripts/*
+!scripts/prepare_dataset.py
+!scripts/preprocess.sh
+!scripts/train.py
+!scripts/predict.py
+!scripts/locations_from_masks.py

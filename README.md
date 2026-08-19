@@ -1,96 +1,99 @@
-# TopAneu26 nnU-Net baseline
+# TopAneu nnU-Net v2 baseline
 
-Task 1과 Task 2를 하나의 `nnU-Net v2 Residual Encoder M, 3d_fullres` 모델로 해결하는 최종 baseline입니다.
+One 52-class nnU-Net v2 segmentation model is used for both challenge tasks.
 
-- Task 2: background 0 + location 1..52의 3D multiclass segmentation
-- Task 1: Task 2 mask에 존재하는 location label을 JSON integer list로 변환
-- split: 환자 그룹 기준 train 283 / validation 65 / test 68
-- TensorBoard: train loss는 매 epoch, validation과 monitor-test는 10 epoch마다
-- terminal: epoch/train batch/validation 진행률을 tqdm progress bar로 표시
-- final test: 학습 종료 후 challenge metric과 Task 1/2 결과 자동 생성
-- run folder: `YYYYMMDD_HHMM` 이름으로 자동 생성
+- Task 2: its NIfTI output is the vessel-location segmentation.
+- Task 1: the non-zero labels present in that segmentation become the required JSON list, for example `[28]`.
 
-## 로컬 D 드라이브 구조
+There is no separate classifier, manual resampling, intensity normalization, vessel-mask input, augmentation code, or post-processing. nnU-Net performs its own required planning, resampling, normalization, and training augmentation.
 
-현재 배치는 다음처럼 자동 인식합니다.
+## Layout
 
 ```text
-topaneu_release/
-├── images/
-├── location_jsons/
-├── location_masks/
-├── location_mapping.json
-└── baseline_work/                 # 이 저장소
-    ├── split.csv                  # 직접 편집 가능
-    ├── train.py
-    └── runs/                      # 자동 생성, Git 제외
+TopAneu_baseline/
+├── split.csv
+├── scripts/
+│   ├── prepare_dataset.py
+│   ├── preprocess.sh
+│   ├── train.py
+│   ├── predict.py
+│   └── locations_from_masks.py
+└── requirements.txt
 ```
 
-서버의 `<repo>/projects/5_TopAneu/topaneu_baseline`, `<repo>/resources/topaneu_release`,
-`<repo>/runs/5_TopAneu` 구조도 자동 인식합니다. 다른 배치에서는 `--data-root`, `--workspace`로 지정합니다.
+The preparation command creates this separate data directory:
 
-## 설치와 실행
+```text
+topaneu_data/
+└── nnUNet_raw/Dataset501_TopAneu/
+    ├── imagesTr/
+    ├── labelsTr/
+    ├── imagesTs/
+    ├── labelsTs/
+    ├── split.csv
+    └── dataset.json
+```
+
+`split.csv` is the single source of truth for the split. Train and validation cases are placed in `imagesTr`/`labelsTr`, because nnU-Net preprocesses both before training. Test cases are isolated in `imagesTs`/`labelsTs` and are never used for preprocessing or training. Files are hard-linked when possible and copied only if links are unavailable.
+
+The split is patient-level and deterministic:
+
+- train: 326 patients, 334 scans
+- validation: 41 patients, 41 scans
+- test: 41 patients, 41 scans
+
+Longitudinal scans from the same patient always remain in the same split. CTA/MRA, center, positive/negative, and available location-label distributions are balanced as far as the dataset permits. Labels with only one or two positive cases remain in train.
+
+## Install
+
+Use a clean Python environment with a CUDA-compatible PyTorch install, then:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-PYTHONPATH=$PWD python train.py --train-all --device cuda
+python -m pip install -r requirements.txt
 ```
 
-기본 모델과 실행 설정:
+## Prepare once
 
-```text
-planner       = nnUNetPlannerResEncM
-plans         = nnUNetResEncUNetMPlans
-configuration = 3d_fullres
-trainer       = nnUNetTrainer
-eval interval = 10 epochs
-```
-
-평가 주기는 `--eval-every N`으로 바꿀 수 있습니다. 중단된 학습은 `--resume`으로 이어서 실행합니다.
-새 학습은 `runs/5_TopAneu/YYYYMMDD_HHMM` 폴더를 자동 생성합니다. 같은 분에 두 번 시작하면 `_02`, `_03`을
-붙입니다. `--resume`은 가장 최근 run을 자동 선택하며, 특정 run은 `--run-name 20260819_1630`으로 지정합니다.
-
-## split.csv
-
-저장소 루트의 `split.csv`에서 `split` 열만 `train`, `validation`, `test` 중 하나로 변경하면 됩니다.
-실행 시 다음을 검증합니다.
-
-- 모든 case의 정확히 한 번 포함
-- 동일 환자의 longitudinal scan 분리 금지
-- 빈 partition 금지
-- 모든 관측 label이 train에 적어도 하나 존재
-
-## TensorBoard
+Run the commands from the `TopAneu_baseline` directory:
 
 ```bash
-tensorboard --logdir ../../../runs/5_TopAneu --port 6006
+python scripts/prepare_dataset.py \
+  --source /path/to/topaneu_release \
+  --split-csv split.csv \
+  --output topaneu_data
 ```
 
-주요 tag:
+This step only arranges the original files in nnU-Net format. It does not resample, normalize, or train anything.
 
-```text
-train/loss/total                              # 매 epoch
-validation/patch/loss/total                   # 10 epoch마다
-validation/patch/dice/mean_foreground         # 10 epoch마다
-validation/patch/dice/class_01..52            # 10 epoch마다
-monitor_test/periodic/macro/*                  # 10 epoch마다
-test/final/macro/*                            # 최종 1회
+## Preprocess once
+
+```bash
+bash scripts/preprocess.sh topaneu_data
 ```
 
-학습 중 반복 평가되는 test는 엄밀한 final test가 아니므로 `monitor_test`로 구분합니다. 최종 challenge metric은
-`Precision`, `Recall`, `MCC`, `Dice`, `VolSim`, `HD95`이며 JSON/CSV와 TensorBoard에 함께 저장됩니다.
+This runs only nnU-Net planning and preprocessing. The generic channel name `angiography` intentionally selects per-case z-score normalization, which is appropriate for a single model trained on both CTA and MRA.
 
-## 결과
+## Train
 
-```text
-runs/5_TopAneu/
-└── YYYYMMDD_HHMM/
-    ├── evaluation/{validation,test}/
-    ├── predictions/internal_test_outputs/{task1,task2}/
-    ├── tensorboard/
-    ├── nnUNet_raw/
-    ├── nnUNet_preprocessed/
-    └── nnUNet_results/
+```bash
+python scripts/train.py \
+  --data-root topaneu_data \
+  --split-csv split.csv
 ```
+
+`train.py` converts the CSV train/validation rows to nnU-Net's `splits_final.json` and trains fold 0 using exactly that split. The test rows are checked against `imagesTs`/`labelsTs` but are not exposed to training. To resume an interrupted training run, add `--continue-training`.
+
+## Predict both tasks
+
+Input files must use nnU-Net single-channel names such as `case_001_0000.nii.gz`.
+
+```bash
+python scripts/predict.py \
+  --images topaneu_data/nnUNet_raw/Dataset501_TopAneu/imagesTs \
+  --model topaneu_data/nnUNet_results/Dataset501_TopAneu/nnUNetTrainer__nnUNetPlans__3d_fullres \
+  --output /path/to/predictions
+```
+
+The resulting `task2_masks/` contains multi-class NIfTI masks. `task1_locations/` contains one JSON list per case with the location IDs present in its Task 2 mask. The model argument is the directory ending in `nnUNetTrainer__nnUNetPlans__3d_fullres` and is used directly, so prediction does not depend on a server-specific `nnUNet_results` path.
+
+Grand Challenge supplies one `.mha` image per container call and expects Task 2 at `/output/images/aneurysm-segmentation/output.mha`. That container adapter is deliberately not mixed into this training baseline; the official template should wrap this model after training.

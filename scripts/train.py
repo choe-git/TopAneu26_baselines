@@ -1,0 +1,82 @@
+"""Train nnU-Net with the train/val rows defined in split.csv."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+from pathlib import Path
+
+from prepare_dataset import DATASET_ID, DATASET_NAME, DEFAULT_SPLIT, read_split
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--split-csv", type=Path, default=DEFAULT_SPLIT)
+    parser.add_argument("--continue-training", action="store_true")
+    return parser.parse_args()
+
+
+def nnunet_paths(data_root: Path) -> dict[str, Path]:
+    root = data_root.resolve()
+    return {
+        "nnUNet_raw": root / "nnUNet_raw",
+        "nnUNet_preprocessed": root / "nnUNet_preprocessed",
+        "nnUNet_results": root / "nnUNet_results",
+    }
+
+
+def write_nnunet_split(split: dict[str, str], preprocessed: Path) -> Path:
+    dataset = preprocessed / f"Dataset{DATASET_ID}_{DATASET_NAME}"
+    if not dataset.is_dir():
+        raise FileNotFoundError(f"Run preprocess.sh first: {dataset}")
+
+    output = dataset / "splits_final.json"
+    content = [{
+        "train": sorted(case for case, name in split.items() if name == "train"),
+        "val": sorted(case for case, name in split.items() if name == "val"),
+    }]
+    output.write_text(json.dumps(content, indent=2) + "\n")
+    return output
+
+
+def validate_prepared_data(split: dict[str, str], raw: Path) -> None:
+    dataset = raw / f"Dataset{DATASET_ID}_{DATASET_NAME}"
+    training = {case for case, name in split.items() if name != "test"}
+    testing = {case for case, name in split.items() if name == "test"}
+
+    def image_cases(directory: str) -> set[str]:
+        return {path.name.removesuffix("_0000.nii.gz") for path in (dataset / directory).glob("*.nii.gz")}
+
+    def label_cases(directory: str) -> set[str]:
+        return {path.name.removesuffix(".nii.gz") for path in (dataset / directory).glob("*.nii.gz")}
+
+    if not (
+        image_cases("imagesTr") == training
+        and label_cases("labelsTr") == training
+        and image_cases("imagesTs") == testing
+        and label_cases("labelsTs") == testing
+    ):
+        raise ValueError("Prepared data does not match split.csv. Run prepare_dataset.py again.")
+
+
+def main() -> None:
+    args = parse_args()
+    split = read_split(args.split_csv)
+    paths = nnunet_paths(args.data_root)
+    validate_prepared_data(split, paths["nnUNet_raw"])
+    split_path = write_nnunet_split(split, paths["nnUNet_preprocessed"])
+
+    environment = os.environ.copy()
+    environment.update({name: str(path) for name, path in paths.items()})
+    command = ["nnUNetv2_train", str(DATASET_ID), "3d_fullres", "0"]
+    if args.continue_training:
+        command.append("--c")
+    print(f"Using split: {split_path}")
+    subprocess.run(command, check=True, env=environment)
+
+
+if __name__ == "__main__":
+    main()
