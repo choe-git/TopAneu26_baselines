@@ -127,6 +127,10 @@ class nnUNetTrainer(BaseTrainer):
 
         self.current_epoch += 1
 
+    def _evaluation_complete(self, epoch: int) -> bool:
+        folder = Path(self.output_folder) / "evaluation" / "metrics" / f"epoch_{epoch:04d}"
+        return all((folder / f"{split}.json").is_file() for split in ("val", "test"))
+
     def run_training(self) -> None:
         self.on_train_start()
         self.cases = self._read_cases()
@@ -134,6 +138,16 @@ class nnUNetTrainer(BaseTrainer):
         final_test_metrics = None
 
         try:
+            if (
+                self.current_epoch > 0
+                and self.current_epoch % EVALUATION_INTERVAL == 0
+                and not self._evaluation_complete(self.current_epoch)
+            ):
+                print(f"Retrying incomplete epoch {self.current_epoch} evaluation")
+                metrics = self._run_full_evaluation(self.current_epoch, writer)
+                final_test_metrics = metrics["test"]
+                writer.flush()
+
             epochs = tqdm(
                 range(self.current_epoch, self.num_epochs),
                 initial=self.current_epoch,
