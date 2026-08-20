@@ -101,7 +101,7 @@ class nnUNetTrainer(BaseTrainer):
                 allow_tqdm=True,
             )
             predictor.manual_initialization(
-                self.network,
+                model,
                 self.plans_manager,
                 self.configuration_manager,
                 [model.state_dict()],
