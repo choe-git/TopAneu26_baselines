@@ -9,6 +9,7 @@
 !scripts/
 scripts/*
 !scripts/prepare_dataset.py
+!scripts/prepare_debug_source.py
 !scripts/preprocess.sh
 !scripts/train.py
 !scripts/trainer.py

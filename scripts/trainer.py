@@ -9,11 +9,19 @@ from time import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
+from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
 from nnunetv2.configuration import default_num_processes
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_raw, nnUNet_results
+from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
+from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
+from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer as BaseTrainer
+from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
+from torch import nn
 from torch._dynamo import OptimizedModule
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -22,9 +30,202 @@ from evaluate import evaluate_predictions, metric_summary, save_metrics
 
 EVALUATION_INTERVAL = 10
 
+TERRITORY_GROUPS = (
+    tuple(range(1, 18)),
+    tuple(range(18, 22)),
+    tuple(range(22, 36)),
+    tuple(range(36, 45)),
+    tuple(range(45, 53)),
+)
+LATERALITY_GROUPS = (
+    (1, 3, 5, 9, 11, 13, 15, 18, 20, 22, 24, 26, 28, 30, 32, 34, 37, 39, 41, 43, 45, 47, 49, 51),
+    (2, 4, 6, 10, 12, 14, 16, 19, 21, 23, 25, 27, 29, 31, 33, 35, 38, 40, 42, 44, 46, 48, 50, 52),
+    (7, 8, 17, 36),
+)
+
+
+def label_to_group(groups: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    result = [0] * 53
+    for group_index, labels in enumerate(groups):
+        for label in labels:
+            result[label] = group_index
+    return tuple(result)
+
+
+class HierarchicalLoss(nn.Module):
+    """Supervise foreground, territory, laterality, and the 52 official locations."""
+
+    territory_by_label = label_to_group(TERRITORY_GROUPS)
+    laterality_by_label = label_to_group(LATERALITY_GROUPS)
+
+    @staticmethod
+    def grouped_logits(logits: torch.Tensor, groups: tuple[tuple[int, ...], ...]) -> torch.Tensor:
+        return torch.stack(
+            [torch.logsumexp(logits[:, [label - 1 for label in labels]], dim=1) for labels in groups],
+            dim=1,
+        )
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        target = target[:, 0].long() if target.ndim == logits.ndim else target.long()
+        foreground = target > 0
+
+        binary_logits = torch.cat(
+            (logits[:, :1], torch.logsumexp(logits[:, 1:], dim=1, keepdim=True)),
+            dim=1,
+        )
+        binary_ce = F.cross_entropy(binary_logits, foreground.long())
+        foreground_probability = torch.softmax(binary_logits, dim=1)[:, 1]
+        intersection = (foreground_probability * foreground).sum()
+        denominator = foreground_probability.sum() + foreground.sum()
+        binary_dice = 1 - (2 * intersection + 1e-5) / (denominator + 1e-5)
+
+        classification_losses = [binary_ce]
+        if foreground.any():
+            fine_logits = logits[:, 1:].movedim(1, -1)[foreground]
+            fine_target = target[foreground] - 1
+            classification_losses.append(F.cross_entropy(fine_logits, fine_target))
+
+            territory_logits = self.grouped_logits(fine_logits, TERRITORY_GROUPS)
+            territory_map = target.new_tensor(self.territory_by_label)
+            classification_losses.append(F.cross_entropy(territory_logits, territory_map[target[foreground]]))
+
+            laterality_logits = self.grouped_logits(fine_logits, LATERALITY_GROUPS)
+            laterality_map = target.new_tensor(self.laterality_by_label)
+            classification_losses.append(F.cross_entropy(laterality_logits, laterality_map[target[foreground]]))
+
+        return binary_dice + torch.stack(classification_losses).mean()
+
+
+class ClassBalancedDataLoader(nnUNetDataLoader):
+    """Use nnU-Net crops while choosing the forced foreground class uniformly."""
+
+    def __init__(self, *args, class_cases: dict[int, list[str]], **kwargs):
+        super().__init__(*args, **kwargs)
+        available = set(self.indices)
+        self.class_cases = {
+            label: sorted(available.intersection(cases))
+            for label, cases in class_cases.items()
+            if available.intersection(cases)
+        }
+        if not self.class_cases:
+            raise ValueError("No foreground locations from class_cases.json occur in the training split.")
+        self.foreground_labels = tuple(sorted(self.class_cases))
+        self._desired_classes = []
+
+    def get_indices(self):
+        selected = list(super().get_indices())
+        desired_classes = [None] * len(selected)
+        for sample_index in range(len(selected)):
+            if self.get_do_oversample(sample_index):
+                label = int(np.random.choice(self.foreground_labels))
+                selected[sample_index] = str(np.random.choice(self.class_cases[label]))
+                desired_classes[sample_index] = label
+        self._desired_classes = desired_classes
+        return selected
+
+    def get_bbox(self, data_shape, force_fg, class_locations, overwrite_class=None, verbose=False):
+        desired_class = self._desired_classes.pop(0) if self._desired_classes else overwrite_class
+        return super().get_bbox(data_shape, force_fg, class_locations, desired_class, verbose)
+
 
 class nnUNetTrainer(BaseTrainer):
-    """Keep nnU-Net defaults; change only training cadence and logging."""
+    """Use nnU-Net v2 with TopAneu-aware loss, sampling, evaluation, and logging."""
+
+    def _build_loss(self):
+        loss = HierarchicalLoss()
+        if self.enable_deep_supervision:
+            weights = np.array([1 / (2**index) for index in range(len(self._get_deep_supervision_scales()))])
+            weights[-1] = 1e-6 if self.is_ddp and not self._do_i_compile() else 0
+            loss = DeepSupervisionWrapper(loss, weights / weights.sum())
+        return loss
+
+    def _read_class_cases(self) -> dict[int, list[str]]:
+        path = Path(nnUNet_raw) / self.plans_manager.dataset_name / "class_cases.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"Run prepare_dataset.py again to create {path.name}.")
+        return {int(label): cases for label, cases in json.loads(path.read_text()).items()}
+
+    def get_dataloaders(self):
+        if self.dataset_class is None:
+            self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
+
+        patch_size = self.configuration_manager.patch_size
+        deep_supervision_scales = self._get_deep_supervision_scales()
+        rotation, dummy_2d, initial_patch_size, mirror_axes = (
+            self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+        )
+        train_transforms = self.get_training_transforms(
+            patch_size,
+            rotation,
+            deep_supervision_scales,
+            mirror_axes,
+            dummy_2d,
+            use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+            is_cascaded=self.is_cascaded,
+            foreground_labels=self.label_manager.foreground_labels,
+            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+            ignore_label=self.label_manager.ignore_label,
+        )
+        val_transforms = self.get_validation_transforms(
+            deep_supervision_scales,
+            is_cascaded=self.is_cascaded,
+            foreground_labels=self.label_manager.foreground_labels,
+            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+            ignore_label=self.label_manager.ignore_label,
+        )
+        dataset_train, dataset_val = self.get_tr_and_val_datasets()
+        common = {
+            "oversample_foreground_percent": self.oversample_foreground_percent,
+            "sampling_probabilities": None,
+            "pad_sides": None,
+            "probabilistic_oversampling": self.probabilistic_oversampling,
+        }
+        loader_train = ClassBalancedDataLoader(
+            dataset_train,
+            self.batch_size,
+            initial_patch_size,
+            patch_size,
+            self.label_manager,
+            transforms=train_transforms,
+            class_cases=self._read_class_cases(),
+            **common,
+        )
+        loader_val = nnUNetDataLoader(
+            dataset_val,
+            self.batch_size,
+            patch_size,
+            patch_size,
+            self.label_manager,
+            transforms=val_transforms,
+            **common,
+        )
+
+        processes = get_allowed_n_proc_DA()
+        if processes == 0:
+            train_augmenter = SingleThreadedAugmenter(loader_train, None)
+            val_augmenter = SingleThreadedAugmenter(loader_val, None)
+        else:
+            train_augmenter = NonDetMultiThreadedAugmenter(
+                data_loader=loader_train,
+                transform=None,
+                num_processes=processes,
+                num_cached=max(6, processes // 2),
+                seeds=None,
+                pin_memory=self.device.type == "cuda",
+                wait_time=0.002,
+            )
+            val_augmenter = NonDetMultiThreadedAugmenter(
+                data_loader=loader_val,
+                transform=None,
+                num_processes=max(1, processes // 2),
+                num_cached=max(3, processes // 4),
+                seeds=None,
+                pin_memory=self.device.type == "cuda",
+                wait_time=0.002,
+            )
+        next(train_augmenter)
+        next(val_augmenter)
+        return train_augmenter, val_augmenter
 
     def _read_cases(self) -> dict[str, list[str]]:
         path = Path(nnUNet_raw) / self.plans_manager.dataset_name / "split.csv"

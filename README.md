@@ -5,7 +5,12 @@ One 52-class nnU-Net v2 segmentation model is used for both challenge tasks.
 - Task 2: its NIfTI output is the vessel-location segmentation.
 - Task 1: the non-zero labels present in that segmentation become the required JSON list, for example `[28]`.
 
-There is no separate classifier, manual resampling, intensity normalization, vessel-mask input, augmentation code, or post-processing. nnU-Net performs its own required planning, resampling, normalization, and training augmentation.
+The network, preprocessing, augmentation, and prediction format remain nnU-Net v2 defaults. Two small training changes add the task-specific inductive bias that the sparse 52-location labels need:
+
+- One loss supervises foreground/background, the five official vessel territories, laterality, and the final 52 locations from the same 53 output logits. There are no extra heads.
+- nnU-Net's forced-foreground batch slot chooses a represented training location uniformly, then uses nnU-Net's own foreground crop for a case containing that location.
+
+There is no separate classifier, manual resampling, intensity normalization, vessel-mask input, custom augmentation, or post-processing.
 
 ## Layout
 
@@ -14,6 +19,7 @@ TopAneu_baseline/
 ├── split.csv
 ├── scripts/
 │   ├── prepare_dataset.py
+│   ├── prepare_debug_source.py
 │   ├── preprocess.sh
 │   ├── train.py
 │   ├── trainer.py
@@ -33,6 +39,7 @@ DATA_ROOT/
 │   ├── imagesTs/
 │   ├── labelsTs/
 │   ├── split.csv
+│   ├── class_cases.json
 │   └── dataset.json
 ├── nnUNet_preprocessed/
 ├── nnUNet_results/
@@ -99,7 +106,7 @@ python scripts/prepare_dataset.py \
   --output "$DATA_ROOT"
 ```
 
-This step only arranges the original files in nnU-Net format. It does not resample, normalize, or train anything.
+This step only arranges the original files in nnU-Net format and writes the small `class_cases.json` index used by the training sampler. It does not resample, normalize, or train anything.
 
 - `--source`: original `topaneu_release` directory
 - `--output`: timestamped experiment directory; no files are written into the source data
@@ -130,6 +137,7 @@ python scripts/train.py \
 - `--continue-training`: resume `checkpoint_latest.pth`
 - `--device`: `cuda` for the server, or `cpu` for diagnostics only
 - `--smoke-test`: 10 epochs with one train/validation iteration; never use for the full experiment
+- `--epochs`, `--train-iterations`, `--val-iterations`: optional debug-budget overrides
 
 Training uses the nnU-Net v2 defaults for 1,000 epochs and 250 training iterations per epoch. Train loss is written every epoch. Every 10 epochs, the trainer computes validation loss and runs full-volume inference on the validation and test sets. TensorBoard records:
 
@@ -145,7 +153,71 @@ To view the logs:
 tensorboard --logdir "$DATA_ROOT/tensorboard"
 ```
 
-For a plumbing-only smoke test, prepare a separate tiny dataset and add `--smoke-test`. This keeps the same model and preprocessing but runs 10 epochs with one train and one validation iteration per epoch. Smoke inference disables mirroring and uses non-overlapping tiles; normal training keeps nnU-Net's default inference settings. If one source case is aliased across all three splits, its metrics only test the pipeline and must not be reported as model performance. Use `--device cpu` only when CUDA is unavailable; it is much slower.
+## Required checks before the full run
+
+The helper creates only hard links when possible. It never edits the release data.
+
+### 1. Positive one-case overfit
+
+This aliases one positive location-49 case into train/validation/test. Leakage is intentional: the only question is whether the complete pipeline can learn one real scan. Its metrics must not be reported as model performance.
+
+```bash
+DEBUG_SOURCE=/tmp/topaneu_overfit
+OVERFIT_ROOT="$RUNS_ROOT/$(date +%Y%m%d_%H%M%S)"
+
+python scripts/prepare_debug_source.py \
+  --source "$SOURCE_ROOT" \
+  --output "$DEBUG_SOURCE" \
+  --profile overfit \
+  --overwrite
+python scripts/prepare_dataset.py \
+  --source "$DEBUG_SOURCE" \
+  --split-csv "$DEBUG_SOURCE/split.csv" \
+  --output "$OVERFIT_ROOT"
+bash scripts/preprocess.sh "$OVERFIT_ROOT"
+python scripts/train.py \
+  --data-root "$OVERFIT_ROOT" \
+  --split-csv "$DEBUG_SOURCE/split.csv" \
+  --smoke-test \
+  --epochs 50 \
+  --train-iterations 20 \
+  --device cuda
+```
+
+Pass criterion: loss clearly falls and the model produces foreground for the repeated case. The exact epoch is not a challenge score.
+
+### 2. Eight-case mini test
+
+This uses four train, two validation, and two test scans. The fixed cases include a common location, one-shot/rare locations, a multi-location case, negative scans, CTA, and MRA.
+
+```bash
+DEBUG_SOURCE=/tmp/topaneu_mini
+MINI_ROOT="$RUNS_ROOT/$(date +%Y%m%d_%H%M%S)"
+
+python scripts/prepare_debug_source.py \
+  --source "$SOURCE_ROOT" \
+  --output "$DEBUG_SOURCE" \
+  --profile mini \
+  --overwrite
+python scripts/prepare_dataset.py \
+  --source "$DEBUG_SOURCE" \
+  --split-csv "$DEBUG_SOURCE/split.csv" \
+  --output "$MINI_ROOT"
+bash scripts/preprocess.sh "$MINI_ROOT"
+python scripts/train.py \
+  --data-root "$MINI_ROOT" \
+  --split-csv "$DEBUG_SOURCE/split.csv" \
+  --smoke-test \
+  --epochs 20 \
+  --train-iterations 20 \
+  --device cuda
+```
+
+### 3. Full-data fresh training
+
+After both checks pass, create a new timestamp and run the normal prepare, preprocess, and train commands above. Do not add `--continue-training`: the previous all-background checkpoint was optimized with a different loss and is not a valid starting point for this baseline.
+
+Use `--device cpu` only for diagnostics; 3D training is much slower on CPU.
 
 ## Predict both tasks
 

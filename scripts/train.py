@@ -19,6 +19,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-csv", type=Path, default=DEFAULT_SPLIT, help="Train/val/test split")
     parser.add_argument("--continue-training", action="store_true", help="Resume checkpoint_latest.pth")
     parser.add_argument("--smoke-test", action="store_true", help="Run the 10-epoch plumbing test")
+    parser.add_argument("--epochs", type=int, help="Override the number of epochs")
+    parser.add_argument("--train-iterations", type=int, help="Override training iterations per epoch")
+    parser.add_argument("--val-iterations", type=int, help="Override validation iterations per evaluation")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda", help="PyTorch device")
     return parser.parse_args()
 
@@ -97,6 +100,16 @@ def main() -> None:
         trainer.num_val_iterations_per_epoch = 1
         trainer.inference_tile_step_size = 1.0
         trainer.inference_use_mirroring = False
+    overrides = {
+        "num_epochs": args.epochs,
+        "num_iterations_per_epoch": args.train_iterations,
+        "num_val_iterations_per_epoch": args.val_iterations,
+    }
+    for name, value in overrides.items():
+        if value is not None:
+            if value < 1:
+                raise ValueError(f"{name} must be at least 1")
+            setattr(trainer, name, value)
     maybe_load_checkpoint(trainer, args.continue_training, False)
     torch.backends.cudnn.benchmark = True
     trainer.run_training()

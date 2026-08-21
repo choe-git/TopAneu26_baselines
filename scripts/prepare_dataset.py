@@ -69,9 +69,16 @@ def dataset_json(labels: dict[str, int], num_training: int) -> dict:
 
 def main() -> None:
     args = parse_args()
-    images = sorted((args.source / "images").glob("*_0000.nii.gz"))
-    if not images:
+    source_images = sorted((args.source / "images").glob("*_0000.nii.gz"))
+    if not source_images:
         raise FileNotFoundError(f"No images found in {args.source / 'images'}")
+
+    split = read_split(args.split_csv)
+    source_cases = {case_id(path) for path in source_images}
+    missing = sorted(set(split) - source_cases)
+    if missing:
+        raise ValueError(f"Cases in split.csv are missing from the source: {missing}")
+    images = [path for path in source_images if case_id(path) in split]
 
     dataset = args.output / "nnUNet_raw" / f"Dataset{DATASET_ID}_{DATASET_NAME}"
     if dataset.exists():
@@ -87,12 +94,7 @@ def main() -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
     labels = json.loads((args.source / "location_mapping.json").read_text())["labels"]
-    split = read_split(args.split_csv)
-    image_cases = {case_id(path) for path in images}
-    if image_cases != set(split):
-        missing = sorted(image_cases - set(split))
-        extra = sorted(set(split) - image_cases)
-        raise ValueError(f"split.csv mismatch: missing={missing}, extra={extra}")
+    class_cases: dict[int, list[str]] = {}
 
     for image_path in images:
         name = case_id(image_path)
@@ -103,9 +105,19 @@ def main() -> None:
         image_dir, label_dir = (images_ts, labels_ts) if split[name] == "test" else (images_tr, labels_tr)
         link_or_copy(image_path, image_dir / image_path.name)
         link_or_copy(label_path, label_dir / label_path.name)
+        if split[name] == "train":
+            locations_path = args.source / "location_jsons" / f"{name}.json"
+            if not locations_path.is_file():
+                raise FileNotFoundError(f"Missing location JSON for {name}")
+            for label in sorted(set(json.loads(locations_path.read_text())["locations"])):
+                if label not in range(1, 53):
+                    raise ValueError(f"Invalid location {label} in {locations_path}")
+                class_cases.setdefault(label, []).append(name)
 
     num_training = sum(value != "test" for value in split.values())
     (dataset / "dataset.json").write_text(json.dumps(dataset_json(labels, num_training), indent=2) + "\n")
+    class_cases = {label: sorted(class_cases[label]) for label in sorted(class_cases)}
+    (dataset / "class_cases.json").write_text(json.dumps(class_cases, indent=2) + "\n")
     shutil.copy2(args.split_csv, dataset / "split.csv")
     counts = {name: sum(value == name for value in split.values()) for name in SPLIT_NAMES}
     print(f"Prepared {counts} in {dataset}")
