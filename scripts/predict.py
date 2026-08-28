@@ -1,46 +1,87 @@
-"""Run one nnU-Net v2 model and create outputs for TopAneu Tasks 1 and 2."""
+"""Predict TopAneu Task 1 JSON and Task 2 NIfTI outputs."""
 
 from __future__ import annotations
 
 import argparse
-import subprocess
-import sys
+import json
 from pathlib import Path
+
+import nibabel as nib
+import numpy as np
+import torch
+
+from rnsa_surrogate.cache import normalize_angiography, resample_zyx, resize_to_shape
+from rnsa_surrogate.inference import sliding_window_predict
+from rnsa_surrogate.model import RNSASurrogate
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--images", type=Path, required=True)
-    parser.add_argument("--model", type=Path, required=True)
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--fold", default="0")
+    parser.add_argument("--modality", choices=("ct", "mr"))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--overlap", type=float, default=0.5)
+    parser.add_argument("--mask-threshold", type=float, default=0.45)
+    parser.add_argument("--class-threshold", type=float, default=0.15)
+    parser.add_argument("--presence-threshold", type=float, default=0.35)
     return parser.parse_args()
-
-
-def run(command: list[str]) -> None:
-    print(" ".join(command))
-    subprocess.run(command, check=True)
 
 
 def main() -> None:
     args = parse_args()
-    task2_output = args.output / "task2_masks"
-    task1_output = args.output / "task1_locations"
-    task2_output.mkdir(parents=True, exist_ok=True)
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable")
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    config = checkpoint["config"]
+    model = RNSASurrogate(**config["model"])
+    state = checkpoint["model"]
+    if "ema" in checkpoint:
+        state = dict(state)
+        for name, value in checkpoint["ema"]["shadow"].items():
+            state[name] = value.to(dtype=state[name].dtype)
+    model.load_state_dict(state)
+    model.to(device)
 
-    run([
-        "nnUNetv2_predict_from_modelfolder",
-        "-i", str(args.images),
-        "-o", str(task2_output),
-        "-f", str(args.fold),
-        "-chk", "checkpoint_final.pth",
-        "-m", str(args.model),
-    ])
-    run([
-        sys.executable, str(Path(__file__).with_name("locations_from_masks.py")),
-        "--masks", str(task2_output),
-        "--output", str(task1_output),
-    ])
+    source = nib.load(args.image)
+    original = np.asarray(source.dataobj, dtype=np.float32).transpose(2, 1, 0)
+    image, _ = normalize_angiography(original)
+    source_spacing = tuple(float(value) for value in reversed(source.header.get_zooms()[:3]))
+    target_spacing = tuple(float(value) for value in config["data"]["target_spacing_zyx"])
+    image = resample_zyx(image, source_spacing, target_spacing, order=1).astype(np.float32)
+    modality = args.modality or ("mr" if "_mr_" in args.image.name.lower() else "ct")
+    amp_name = str(config["train"].get("amp", "none"))
+    amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "none": None}[amp_name]
+    segmentation, locations, _ = sliding_window_predict(
+        model,
+        image,
+        modality,
+        config["data"]["patch_size"],
+        device,
+        overlap=args.overlap,
+        amp_dtype=amp_dtype,
+        mask_threshold=args.mask_threshold,
+        class_threshold=args.class_threshold,
+        presence_threshold=args.presence_threshold,
+    )
+
+    task2_dir = args.output / "task2_masks"
+    task1_dir = args.output / "task1_locations"
+    task2_dir.mkdir(parents=True, exist_ok=True)
+    task1_dir.mkdir(parents=True, exist_ok=True)
+    case_id = args.image.name.removesuffix(".nii.gz").removesuffix("_0000")
+    segmentation = resize_to_shape(segmentation, original.shape, order=0).astype(np.uint8)
+    header = source.header.copy()
+    header.set_data_dtype(np.uint8)
+    nib.save(
+        nib.Nifti1Image(segmentation.transpose(2, 1, 0), source.affine, header),
+        task2_dir / f"{case_id}.nii.gz",
+    )
+    (task1_dir / f"{case_id}.json").write_text(json.dumps(locations) + "\n", encoding="utf-8")
+    print(f"Task 1: {locations}")
+    print(f"Task 2: {task2_dir / f'{case_id}.nii.gz'}")
 
 
 if __name__ == "__main__":

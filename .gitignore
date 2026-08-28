@@ -1,18 +1,7 @@
-# Publish only the baseline source files.
-*
-
-!.gitignore
-!README.md
-!requirements.txt
-!split.csv
-
-!scripts/
-scripts/*
-!scripts/prepare_dataset.py
-!scripts/prepare_debug_source.py
-!scripts/preprocess.sh
-!scripts/train.py
-!scripts/trainer.py
-!scripts/evaluate.py
-!scripts/predict.py
-!scripts/locations_from_masks.py
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+runs/
+predictions/
+*.pt

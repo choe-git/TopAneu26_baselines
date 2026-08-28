@@ -1,0 +1,40 @@
+experiment:
+  name: rnsa_surrogate_baseline
+  seed: 2026
+data:
+  target_spacing_zyx: [0.60, 0.60, 0.60]
+  patch_size: [64, 96, 96]
+  positive_fraction: 0.70
+  vessel_negative_fraction: 0.50
+  train_samples: 1200
+  val_samples: 160
+  test_samples: 160
+  num_workers: 4
+  prefetch_factor: 1
+  test_num_workers: 0
+model:
+  in_channels: 5
+  base_channels: 16
+  levels: 4
+  vessel_classes: 37
+  location_classes: 52
+train:
+  epochs: 200
+  batch_size: 1
+  accumulate_steps: 4
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  warmup_epochs: 10
+  amp: bf16
+  grad_clip: 12.0
+  ema_decay: 0.999
+  validate_every: 5
+  test_every: 25
+  checkpoint_every: 25
+  device: cuda
+loss:
+  aneurysm: 1.0
+  location_seg: 0.5
+  vessel: 0.1
+  location_presence: 0.1
+  aneurysm_presence: 0.05
