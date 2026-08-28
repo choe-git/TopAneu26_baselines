@@ -16,10 +16,16 @@ from torch.utils.data import DataLoader, Sampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from rnsa_surrogate.cache import atomic_json_dump, load_cache_index, sha256_file, validate_cache
+from rnsa_surrogate.cache import (
+    atomic_json_dump,
+    load_cache_index,
+    sha256_file,
+    validate_cache,
+)
 from rnsa_surrogate.data import CachedTopAneuPatchDataset
 from rnsa_surrogate.losses import multitask_loss
 from rnsa_surrogate.model import RNSASurrogate
+from rnsa_surrogate.run_layout import BaselineRunLayout, create_legacy_run
 from rnsa_surrogate.runtime import (
     ExponentialMovingAverage,
     append_log,
@@ -52,12 +58,22 @@ class EpochIndexSampler(Sampler[int]):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser.add_argument("--config", type=Path, default=Path("configs/baseline.yaml"))
-    parser.add_argument("--run-dir", type=Path, required=True, help="Shared cache/model/log root")
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument(
+        "--run-dir", type=Path, help="Shared timestamped cache/baseline root"
+    )
+    destination.add_argument(
+        "--output-root", type=Path, help="Legacy name/timestamp output root"
+    )
     parser.add_argument("--cache", type=Path, help="Override RUN_DIR/cache")
     parser.add_argument("--device", choices=("cuda", "cpu", "auto"))
-    parser.add_argument("--resume", type=Path, help="Resume checkpoint_latest.pth in place")
+    parser.add_argument(
+        "--resume", type=Path, help="Resume checkpoint_latest.pth in place"
+    )
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args()
 
@@ -86,14 +102,21 @@ def training_contract(config: dict[str, Any]) -> dict[str, Any]:
                 "accumulate_steps",
                 "learning_rate",
                 "weight_decay",
+                "warmup_epochs",
                 "amp",
+                "ema_decay",
             )
         },
     }
 
 
 def make_dataset(
-    config: dict[str, Any], cache_dir: Path, split: str, samples: int, augment: bool, seed: int
+    config: dict[str, Any],
+    cache_dir: Path,
+    split: str,
+    samples: int,
+    augment: bool,
+    seed: int,
 ) -> CachedTopAneuPatchDataset:
     data = config["data"]
     return CachedTopAneuPatchDataset(
@@ -175,7 +198,9 @@ def run_epoch(
     with context():
         batches = tqdm(loader, desc=split.capitalize(), leave=False)
         for step, batch in enumerate(batches):
-            batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+            batch = {
+                key: value.to(device, non_blocking=True) for key, value in batch.items()
+            }
             with torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
                 outputs = model(batch["image"])
                 loss, metrics = multitask_loss(outputs, batch, weights)
@@ -200,7 +225,9 @@ def run_epoch(
     return mean_metrics(values)
 
 
-def write_metrics(model_dir: Path, split: str, epoch: int, metrics: dict[str, float]) -> None:
+def write_metrics(
+    model_dir: Path, split: str, epoch: int, metrics: dict[str, float]
+) -> None:
     atomic_json_dump(
         {"epoch": epoch, "split": split, "metrics": metrics},
         model_dir / "metrics" / split / f"epoch_{epoch:04d}.json",
@@ -229,25 +256,37 @@ def main() -> None:
         config["data"]["test_samples"] = 2
         config["data"]["num_workers"] = 0
 
-    run_root = args.run_dir.resolve()
-    cache_dir = (args.cache or run_root / "cache").resolve()
-    model_dir = run_root / "model"
-    tensorboard_dir = run_root / "tensorboard"
-    status_path = model_dir / "status.json"
     resume_path = args.resume.resolve() if args.resume is not None else None
-    if resume_path is None:
-        if model_dir.exists() and any(model_dir.iterdir()):
-            raise FileExistsError(f"Model run already exists: {model_dir}")
-        model_dir.mkdir(parents=True, exist_ok=True)
-    elif resume_path.parent != model_dir:
-        raise ValueError(f"Resume checkpoint must be inside {model_dir}")
+    if args.run_dir is not None:
+        layout = BaselineRunLayout.from_root(args.run_dir)
+        run_root = layout.root
+        cache_dir = (args.cache or layout.cache).resolve()
+        model_dir = layout.baseline
+        tensorboard_dir = layout.tensorboard
+        if resume_path is not None and resume_path.parent != model_dir:
+            raise ValueError(f"Resume checkpoint must be inside {model_dir}")
+    else:
+        if args.cache is None:
+            raise ValueError("--cache is required when --run-dir is not used")
+        cache_dir = args.cache.resolve()
+        if resume_path is not None:
+            model_dir = resume_path.parent
+        else:
+            model_dir = create_legacy_run(
+                args.output_root or Path("runs"), str(config["experiment"]["name"])
+            )
+        run_root = model_dir
+        tensorboard_dir = model_dir / "tensorboard"
+    status_path = model_dir / "status.json"
 
     seed = int(config["experiment"].get("seed", 2026))
     seed_everything(seed)
     device = resolve_device(str(config["train"].get("device", "cuda")))
     cache_report = validate_cache(cache_dir, deep=False)
     cache_index = load_cache_index(cache_dir)
-    if not np.allclose(cache_index["target_spacing_zyx"], config["data"]["target_spacing_zyx"]):
+    if not np.allclose(
+        cache_index["target_spacing_zyx"], config["data"]["target_spacing_zyx"]
+    ):
         raise ValueError("Cache spacing differs from data.target_spacing_zyx")
 
     contract = training_contract(config)
@@ -255,12 +294,21 @@ def main() -> None:
     checkpoint: dict[str, Any] | None = None
     if resume_path is not None:
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if checkpoint.get("stage", "baseline") != "baseline":
+            raise ValueError(
+                f"Checkpoint stage is not baseline: {checkpoint.get('stage')}"
+            )
         if checkpoint["contract_sha256"] != contract_sha256:
             raise ValueError("Resume training contract differs from checkpoint")
         if checkpoint["cache_index_sha256"] != cache_report["index_sha256"]:
             raise ValueError("Resume cache provenance differs from checkpoint")
 
     if checkpoint is None:
+        if args.run_dir is not None:
+            if model_dir.exists() and any(model_dir.iterdir()):
+                raise FileExistsError(f"Baseline run already exists: {model_dir}")
+            run_root.mkdir(parents=True, exist_ok=True)
+            model_dir.mkdir(parents=False, exist_ok=False)
         atomic_json_dump(config, model_dir / "config.json")
         atomic_json_dump(environment_payload(), model_dir / "environment.json")
         atomic_json_dump(
@@ -273,11 +321,25 @@ def main() -> None:
             },
             model_dir / "inputs.json",
         )
+    else:
+        atomic_json_dump(config, model_dir / "config.json")
+    atomic_json_dump(
+        {
+            "data": {
+                "cache_index": cache_report["index"],
+                "cache_index_sha256": cache_report["index_sha256"],
+                "target_spacing_zyx": cache_index["target_spacing_zyx"],
+            }
+        },
+        model_dir / "provenance.json",
+    )
     train_samples = int(config["data"]["train_samples"])
     val_samples = int(config["data"]["val_samples"])
     test_samples = int(config["data"].get("test_samples", val_samples))
     train_dataset = make_dataset(config, cache_dir, "train", train_samples, True, seed)
-    val_dataset = make_dataset(config, cache_dir, "val", val_samples, False, seed + 10_000_000)
+    val_dataset = make_dataset(
+        config, cache_dir, "val", val_samples, False, seed + 10_000_000
+    )
     test_every = int(config["train"].get("test_every", 0))
     test_dataset = (
         make_dataset(config, cache_dir, "test", test_samples, False, seed + 20_000_000)
@@ -315,8 +377,12 @@ def main() -> None:
         int(config["train"].get("warmup_epochs", 0)) * updates_per_epoch,
     )
     dtype = amp_dtype(str(config["train"].get("amp", "none")), device)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and dtype == torch.float16)
-    ema = ExponentialMovingAverage(model, float(config["train"].get("ema_decay", 0.999)))
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=device.type == "cuda" and dtype == torch.float16
+    )
+    ema = ExponentialMovingAverage(
+        model, float(config["train"].get("ema_decay", 0.999))
+    )
     start_epoch, best_validation = 0, float("inf")
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
@@ -327,12 +393,28 @@ def main() -> None:
         start_epoch = int(checkpoint["epoch"])
         best_validation = float(checkpoint["best_validation"])
         restore_rng_state(checkpoint.get("rng"))
+        carried_best = (model_dir / "checkpoint_best.pth").is_file()
+        if not carried_best:
+            best_validation = float("inf")
         atomic_json_dump(
-            {"checkpoint": str(resume_path), "start_epoch": start_epoch + 1},
+            {
+                "checkpoint": str(resume_path),
+                "start_epoch": start_epoch + 1,
+                "carried_best": carried_best,
+                "best_validation_reset": not carried_best,
+                "in_place": True,
+            },
             model_dir / "resume.json",
         )
 
-    write_status(status_path, "running", device=str(device), resumed=checkpoint is not None)
+    if start_epoch > epochs:
+        raise ValueError(
+            f"Checkpoint already passed epoch {start_epoch}; requested epochs={epochs}"
+        )
+
+    write_status(
+        status_path, "running", device=str(device), resumed=checkpoint is not None
+    )
     writer = SummaryWriter(tensorboard_dir, purge_step=start_epoch + 1)
     log_path = model_dir / "training_log.txt"
     try:
@@ -356,8 +438,11 @@ def main() -> None:
             )
             write_metrics(model_dir, "train", epoch, train_metrics)
             for name, value in train_metrics.items():
-                writer.add_scalar(f"loss/train/{name}", value, epoch)
-            writer.add_scalar("optimizer/learning_rate", optimizer.param_groups[0]["lr"], epoch)
+                writer.add_scalar(f"loss_components/train/{name}", value, epoch)
+            writer.add_scalar("loss/train", train_metrics["total"], epoch)
+            writer.add_scalar(
+                "optimizer/learning_rate", optimizer.param_groups[0]["lr"], epoch
+            )
 
             validate_every = int(config["train"].get("validate_every", 1))
             validation_metrics = None
@@ -368,7 +453,8 @@ def main() -> None:
                     )
                 write_metrics(model_dir, "val", epoch, validation_metrics)
                 for name, value in validation_metrics.items():
-                    writer.add_scalar(f"loss/val/{name}", value, epoch)
+                    writer.add_scalar(f"loss_components/val/{name}", value, epoch)
+                writer.add_scalar("loss/val", validation_metrics["total"], epoch)
 
             if test_loader is not None and (epoch % test_every == 0 or epoch == epochs):
                 with ema.average_parameters(model):
@@ -377,9 +463,11 @@ def main() -> None:
                     )
                 write_metrics(model_dir, "test", epoch, test_metrics)
                 for name, value in test_metrics.items():
-                    writer.add_scalar(f"loss/test/{name}", value, epoch)
+                    writer.add_scalar(f"loss_components/test/{name}", value, epoch)
+                writer.add_scalar("loss/test", test_metrics["total"], epoch)
 
             state = {
+                "stage": "baseline",
                 "epoch": epoch,
                 "model": model.state_dict(),
                 "ema": ema.state_dict(),
@@ -392,20 +480,19 @@ def main() -> None:
                 "cache_index_sha256": cache_report["index_sha256"],
                 "rng": rng_state(),
             }
-            if validation_metrics is not None and validation_metrics["total"] < best_validation:
+            if (
+                validation_metrics is not None
+                and validation_metrics["total"] < best_validation
+            ):
                 best_validation = validation_metrics["total"]
                 state["best_validation"] = best_validation
                 save_checkpoint(state, model_dir / "checkpoint_best.pth")
-            save_checkpoint(state, model_dir / "checkpoint_latest.pth")
-            checkpoint_every = int(config["train"].get("checkpoint_every", 0))
-            if checkpoint_every > 0 and epoch % checkpoint_every == 0:
-                save_checkpoint(state, model_dir / f"checkpoint_epoch_{epoch:04d}.pth")
-            message = f"epoch={epoch}/{epochs} train_total={train_metrics['total']:.6f}"
+            if validation_metrics is not None or epoch == epochs:
+                save_checkpoint(state, model_dir / "checkpoint_latest.pth")
+            message = f"Epoch {epoch}/{epochs}: train_loss={train_metrics['total']:.6f}"
             if validation_metrics is not None:
-                message += f" val_total={validation_metrics['total']:.6f}"
-            message += (
-                f" lr={optimizer.param_groups[0]['lr']:.8g} seconds={perf_counter() - started:.1f}"
-            )
+                message += f", val_loss={validation_metrics['total']:.6f}"
+            message += f", time={perf_counter() - started:.1f}s"
             append_log(log_path, message)
             writer.flush()
 
@@ -417,10 +504,13 @@ def main() -> None:
             checkpoint=str(model_dir / "checkpoint_best.pth"),
         )
     except BaseException as error:
-        write_status(status_path, "failed", error_type=type(error).__name__, error=str(error))
+        write_status(
+            status_path, "failed", error_type=type(error).__name__, error=str(error)
+        )
         raise
     finally:
         writer.close()
+    print(f"Completed run: {model_dir}")
 
 
 if __name__ == "__main__":

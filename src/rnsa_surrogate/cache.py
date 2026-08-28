@@ -17,14 +17,21 @@ from scipy import ndimage
 from tqdm import tqdm
 
 CACHE_VERSION = 1
-REQUIRED_SOURCE_DIRECTORIES = ("images", "location_masks", "location_jsons", "vessel_masks")
+REQUIRED_SOURCE_DIRECTORIES = (
+    "images",
+    "location_masks",
+    "location_jsons",
+    "vessel_masks",
+)
 
 
 def atomic_json_dump(payload: Any, path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     os.replace(temporary, path)
 
 
@@ -33,7 +40,11 @@ def atomic_save_npy(path: Path, array: np.ndarray) -> None:
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
         ) as handle:
             temporary = Path(handle.name)
             np.save(handle, array, allow_pickle=False)
@@ -60,7 +71,9 @@ def read_split_csv(path: str | Path) -> dict[str, str]:
         reader = csv.DictReader(handle)
         expected = ["case_id", "train", "val", "test"]
         if reader.fieldnames != expected:
-            raise ValueError(f"Expected split columns {expected}, got {reader.fieldnames}")
+            raise ValueError(
+                f"Expected split columns {expected}, got {reader.fieldnames}"
+            )
         for row in reader:
             selected = [name for name in ("train", "val", "test") if row[name] == "1"]
             if len(selected) != 1 or row["case_id"] in result:
@@ -81,7 +94,11 @@ def case_id_from_image(path: str | Path) -> str:
 
 def case_domain(case_id: str) -> tuple[str, str]:
     tokens = case_id.split("_")
-    return (tokens[1].lower(), tokens[2].lower()) if len(tokens) >= 4 else ("unknown", "unknown")
+    return (
+        (tokens[1].lower(), tokens[2].lower())
+        if len(tokens) >= 4
+        else ("unknown", "unknown")
+    )
 
 
 def patient_id(case_id: str) -> str:
@@ -134,18 +151,27 @@ def resample_zyx(
     )
     if np.allclose(factors, 1.0, atol=1e-4):
         return np.asarray(array).copy()
-    return ndimage.zoom(array, factors, order=order, mode="nearest", prefilter=order > 1)
+    return ndimage.zoom(
+        array, factors, order=order, mode="nearest", prefilter=order > 1
+    )
 
 
-def resize_to_shape(array: np.ndarray, shape_zyx: Sequence[int], order: int) -> np.ndarray:
+def resize_to_shape(
+    array: np.ndarray, shape_zyx: Sequence[int], order: int
+) -> np.ndarray:
     target = tuple(int(value) for value in shape_zyx)
     if array.shape == target:
         return np.asarray(array).copy()
-    factors = np.asarray(target, dtype=np.float64) / np.asarray(array.shape, dtype=np.float64)
-    resized = ndimage.zoom(array, factors, order=order, mode="nearest", prefilter=order > 1)
+    factors = np.asarray(target, dtype=np.float64) / np.asarray(
+        array.shape, dtype=np.float64
+    )
+    resized = ndimage.zoom(
+        array, factors, order=order, mode="nearest", prefilter=order > 1
+    )
     result = np.zeros(target, dtype=resized.dtype)
     common = tuple(
-        min(source, destination) for source, destination in zip(resized.shape, target, strict=True)
+        min(source, destination)
+        for source, destination in zip(resized.shape, target, strict=True)
     )
     slices = tuple(slice(0, value) for value in common)
     result[slices] = resized[slices]
@@ -183,9 +209,13 @@ def _preserve_component_centers(original: np.ndarray, resampled: np.ndarray) -> 
         for center in centers:
             mapped = np.rint((np.asarray(center) + 0.5) * scale - 0.5).astype(int)
             mapped = np.clip(mapped, 0, np.asarray(resampled.shape) - 1)
-            lower, upper = np.maximum(mapped - 1, 0), np.minimum(mapped + 2, resampled.shape)
+            lower, upper = (
+                np.maximum(mapped - 1, 0),
+                np.minimum(mapped + 2, resampled.shape),
+            )
             local = tuple(
-                slice(int(low), int(high)) for low, high in zip(lower, upper, strict=True)
+                slice(int(low), int(high))
+                for low, high in zip(lower, upper, strict=True)
             )
             if np.any(resampled[local] == class_id):
                 continue
@@ -227,7 +257,9 @@ def _instances(location: np.ndarray) -> tuple[np.ndarray, list[dict[str, Any]]]:
     return instance_map, records
 
 
-def _sample_vessel_points(vessel: np.ndarray, seed: int, limit: int = 4096) -> list[list[int]]:
+def _sample_vessel_points(
+    vessel: np.ndarray, seed: int, limit: int = 4096
+) -> list[list[int]]:
     flat = np.flatnonzero(vessel > 0)
     if flat.size == 0:
         return []
@@ -273,10 +305,14 @@ def build_cache(
     if not source_root.is_dir():
         raise FileNotFoundError(source_root)
     missing_directories = [
-        name for name in REQUIRED_SOURCE_DIRECTORIES if not (source_root / name).is_dir()
+        name
+        for name in REQUIRED_SOURCE_DIRECTORIES
+        if not (source_root / name).is_dir()
     ]
     if missing_directories:
-        raise FileNotFoundError(f"Invalid source root {source_root}; missing {missing_directories}")
+        raise FileNotFoundError(
+            f"Invalid source root {source_root}; missing {missing_directories}"
+        )
 
     images = sorted((source_root / "images").glob("*_0000.nii.gz"))
     split = read_split_csv(split_csv)
@@ -313,11 +349,13 @@ def build_cache(
             raise ValueError(f"Image/location geometry mismatch: {case_id}")
         source_spacing = spacing_zyx(image_meta)
         normalized, intensity_stats = normalize_angiography(image)
-        normalized = resample_zyx(normalized, source_spacing, target_spacing, 1).astype(np.float16)
-        original_location = np.asarray(location, dtype=np.uint8)
-        location = resample_zyx(original_location, source_spacing, target_spacing, 0).astype(
-            np.uint8
+        normalized = resample_zyx(normalized, source_spacing, target_spacing, 1).astype(
+            np.float16
         )
+        original_location = np.asarray(location, dtype=np.uint8)
+        location = resample_zyx(
+            original_location, source_spacing, target_spacing, 0
+        ).astype(np.uint8)
         preserved_components = _preserve_component_centers(original_location, location)
 
         vessel_valid = vessel_path.is_file()
@@ -325,7 +363,9 @@ def build_cache(
             vessel, vessel_meta = load_zyx(vessel_path)
             if not _same_geometry(image_meta, vessel_meta):
                 raise ValueError(f"Image/vessel geometry mismatch: {case_id}")
-            vessel = resample_zyx(vessel, source_spacing, target_spacing, 0).astype(np.uint8)
+            vessel = resample_zyx(vessel, source_spacing, target_spacing, 0).astype(
+                np.uint8
+            )
         else:
             vessel = np.zeros(location.shape, dtype=np.uint8)
         if normalized.shape != location.shape or vessel.shape != location.shape:
@@ -338,7 +378,9 @@ def build_cache(
         atomic_save_npy(case_dir / "vessel.npy", vessel)
         atomic_save_npy(case_dir / "instances.npy", instances)
         center, modality = case_domain(case_id)
-        json_locations = json.loads(json_path.read_text(encoding="utf-8")).get("locations", [])
+        json_locations = json.loads(json_path.read_text(encoding="utf-8")).get(
+            "locations", []
+        )
         record = {
             "case_id": case_id,
             "patient_id": patient_id(case_id),
@@ -378,9 +420,13 @@ def build_cache(
 
 def load_cache_index(path: str | Path) -> dict[str, Any]:
     requested = Path(path)
-    index_path = requested if requested.name == "index.json" else requested / "index.json"
+    index_path = (
+        requested if requested.name == "index.json" else requested / "index.json"
+    )
     if not index_path.is_file():
-        partial = sum(1 for item in (index_path.parent / "cases").glob("*") if item.is_dir())
+        partial = sum(
+            1 for item in (index_path.parent / "cases").glob("*") if item.is_dir()
+        )
         raise FileNotFoundError(
             f"Missing cache index {index_path}; partial case directories={partial}"
         )
@@ -401,7 +447,13 @@ def validate_cache(path: str | Path, deep: bool = False) -> dict[str, Any]:
         split_counts[case["split"]] += 1
         restored += int(case.get("preserved_components", 0))
         case_dir = root / case["cache_dir"]
-        for filename in ("image.npy", "location.npy", "vessel.npy", "instances.npy", "meta.json"):
+        for filename in (
+            "image.npy",
+            "location.npy",
+            "vessel.npy",
+            "instances.npy",
+            "meta.json",
+        ):
             if not (case_dir / filename).is_file():
                 errors.append(f"{case['case_id']}: missing {filename}")
         if deep and not errors:
@@ -412,7 +464,10 @@ def validate_cache(path: str | Path, deep: bool = False) -> dict[str, Any]:
             expected = tuple(case["shape_zyx"])
             if any(array.shape != expected for array in arrays.values()):
                 errors.append(f"{case['case_id']}: shape mismatch")
-            if arrays["image"].dtype != np.float16 or arrays["location"].dtype != np.uint8:
+            if (
+                arrays["image"].dtype != np.float16
+                or arrays["location"].dtype != np.uint8
+            ):
                 errors.append(f"{case['case_id']}: dtype mismatch")
             if not np.isfinite(arrays["image"]).all():
                 errors.append(f"{case['case_id']}: non-finite image")

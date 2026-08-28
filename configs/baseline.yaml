@@ -28,9 +28,8 @@ train:
   amp: bf16
   grad_clip: 12.0
   ema_decay: 0.999
-  validate_every: 5
-  test_every: 25
-  checkpoint_every: 25
+  validate_every: 10
+  test_every: 0
   device: cuda
 loss:
   aneurysm: 1.0

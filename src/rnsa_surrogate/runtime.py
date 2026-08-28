@@ -42,7 +42,8 @@ def environment_payload() -> dict[str, Any]:
         "cuda_build": torch.version.cuda,
         "cuda_available": torch.cuda.is_available(),
         "cuda_devices": [
-            torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())
+            torch.cuda.get_device_name(index)
+            for index in range(torch.cuda.device_count())
         ],
     }
 
@@ -61,8 +62,7 @@ def save_checkpoint(payload: dict[str, Any], path: str | Path) -> None:
 
 
 def append_log(path: Path, message: str) -> None:
-    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    line = f"{timestamp} {message.rstrip()}"
+    line = message.rstrip()
     with path.open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")
     print(line)
@@ -114,7 +114,9 @@ class ExponentialMovingAverage:
 
     def copy_to(self, model: torch.nn.Module) -> None:
         state = model.state_dict()
-        state.update({name: value.to(state[name].dtype) for name, value in self.shadow.items()})
+        state.update(
+            {name: value.to(state[name].dtype) for name, value in self.shadow.items()}
+        )
         model.load_state_dict(state)
 
     @contextmanager

@@ -10,7 +10,9 @@ from rnsa_surrogate.cache import atomic_json_dump, validate_cache
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--deep", action="store_true")
     parser.add_argument("--output", type=Path)

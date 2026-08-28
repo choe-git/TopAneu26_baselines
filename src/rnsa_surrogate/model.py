@@ -38,7 +38,10 @@ class Encoder(nn.Module):
         super().__init__()
         self.stem = nn.Conv3d(in_channels, channels[0], 3, padding=1, bias=False)
         self.stages = nn.ModuleList(
-            [nn.Sequential(ResidualBlock(value), ResidualBlock(value)) for value in channels]
+            [
+                nn.Sequential(ResidualBlock(value), ResidualBlock(value))
+                for value in channels
+            ]
         )
         self.down = nn.ModuleList(
             [
@@ -95,7 +98,9 @@ class Decoder(nn.Module):
 
 
 def weighted_pool(features: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    weights = F.interpolate(weights, size=features.shape[2:], mode="trilinear", align_corners=False)
+    weights = F.interpolate(
+        weights, size=features.shape[2:], mode="trilinear", align_corners=False
+    )
     weights = weights.clamp_min(1e-4)
     return (features * weights).sum((2, 3, 4)) / weights.sum((2, 3, 4))
 

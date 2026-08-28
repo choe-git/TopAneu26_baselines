@@ -40,9 +40,21 @@ classification을 보조 신호로 사용합니다. 좌우 flip은 image만 뒤�
 CUDA에 맞는 PyTorch를 먼저 설치한 clean environment에서 실행합니다.
 
 ```bash
-cd TopAneu26_baselines
+export USER_ROOT="/home/introai30/.apni/users/yhchoe"
+export PROJECTS_ROOT="$USER_ROOT/projects"
+export REPO_ROOT="$PROJECTS_ROOT/5_TopAneu/TopAneu_baseline"
+export DATA_ROOT="$PROJECTS_ROOT/resources/topaneu_release"
+export SPLIT_CSV="$REPO_ROOT/split.csv"
+export RUN_ROOT="$PROJECTS_ROOT/runs/5_TopAneu/baseline"
+export RUN_ID="$(date +%Y%m%d_%H%M%S)"
+export RUN_DIR="$RUN_ROOT/$RUN_ID"
+
+cd "$REPO_ROOT"
 python -m pip install -e '.[train]'
 ```
+
+Cache 생성부터 추론까지 같은 `RUN_ID`와 `RUN_DIR`을 유지합니다. 재접속 후에는 새 시간을 만들지
+말고 기존 `RUN_ID`를 다시 지정해야 합니다.
 
 ## 1. Physical-space cache 생성
 
@@ -53,11 +65,9 @@ center에 1-voxel seed를 복원합니다. 이 구조와 로깅 계약은
 [TopAneu26 Prototype](https://github.com/choe-git/TopAneu26_Prototype)의 pipeline을 참고했습니다.
 
 ```bash
-RUN_DIR=/path/to/runs/RNSA_surrogate/$(date +%Y%m%d_%H%M%S)
-
 python scripts/prepare_cache.py \
-  --source /path/to/topaneu_release \
-  --split-csv split.csv \
+  --source "$DATA_ROOT" \
+  --split-csv "$SPLIT_CSV" \
   --run-dir "$RUN_DIR" \
   --spacing 0.6 0.6 0.6
 
@@ -69,6 +79,20 @@ python scripts/inspect_cache.py \
 
 `cache/index.json`이 cache의 commit marker입니다. 중간에 작업이 끊겨 index가 없으면 학습이
 시작되지 않습니다. `--overwrite`는 같은 cache를 의도적으로 다시 만들 때만 사용합니다.
+
+Cache CLI 전체 계약:
+
+| argument | 필수 | 의미 |
+|---|---:|---|
+| `--source PATH` | 예 | `images`, `location_masks`, `location_jsons`, `vessel_masks`를 포함한 release root |
+| `--split-csv PATH` | 예 | train/val/test 분할 CSV |
+| `--run-dir PATH` | 권장 | cache를 `RUN_DIR/cache`에 생성 |
+| `--output PATH` | 대안 | cache 직접 경로; `--run-dir`와 동시 사용 불가 |
+| `--spacing Z Y X` | 아니오 | 기본값 `0.6 0.6 0.6` |
+| `--overwrite` | 아니오 | 기존 cache를 의도적으로 재생성 |
+
+검사 CLI는 `--cache PATH`가 필수이고, `--deep`은 각 array header까지 검사하며,
+`--output PATH`는 JSON report 저장 위치입니다.
 
 ## 2. 학습
 
@@ -92,26 +116,29 @@ RUN_DIR/
 │   ├── index.json
 │   └── cases/<case_id>/{image,location,vessel,instances}.npy
 ├── cache_report.json
-├── model/
+├── baseline/
 │   ├── config.json
 │   ├── environment.json
 │   ├── inputs.json
+│   ├── provenance.json
 │   ├── model.json
 │   ├── status.json
 │   ├── training_log.txt
 │   ├── checkpoint_latest.pth
 │   ├── checkpoint_best.pth
-│   ├── checkpoint_epoch_XXXX.pth
 │   └── metrics/{train,val,test}/epoch_XXXX.json
-└── tensorboard/
+├── predictions/
+└── tensorboard/baseline/
 ```
 
-TensorBoard에는 각 loss component, total loss, learning rate를 split별로 기록합니다. Validation과
+Prototype과 같은 `loss/train`, `loss/val` tag를 기록하고, 세부 loss component와 learning rate도
+별도 tag로 남깁니다. Validation과
 best checkpoint는 EMA weight로 계산하고, latest checkpoint에는 model/EMA/optimizer/scheduler/
-GradScaler/RNG state가 모두 들어갑니다.
+GradScaler/RNG state가 모두 들어갑니다. Prototype과 동일하게 validation 주기 및 마지막 epoch에만
+`checkpoint_latest.pth`를 원자적으로 갱신하며 epoch별 checkpoint는 만들지 않습니다.
 
 ```bash
-tensorboard --logdir "$RUN_DIR/tensorboard"
+tensorboard --logdir "$RUN_DIR/tensorboard/baseline"
 ```
 
 중단된 run은 같은 위치에서 이어갑니다.
@@ -121,8 +148,20 @@ python scripts/train.py \
   --config configs/baseline.yaml \
   --run-dir "$RUN_DIR" \
   --device cuda \
-  --resume "$RUN_DIR/model/checkpoint_latest.pth"
+  --resume "$RUN_DIR/baseline/checkpoint_latest.pth"
 ```
+
+Train CLI 전체 계약:
+
+| argument | 필수 | 의미 |
+|---|---:|---|
+| `--config PATH` | 아니오 | 기본값 `configs/baseline.yaml` |
+| `--run-dir PATH` | 권장 | `RUN_DIR/cache`, `RUN_DIR/baseline`, `RUN_DIR/tensorboard/baseline` 사용 |
+| `--cache PATH` | 조건부 | cache 경로 override; `--run-dir`이 없으면 필수 |
+| `--resume PATH` | 아니오 | 같은 run의 `checkpoint_latest.pth` |
+| `--device cuda\|cpu\|auto` | 아니오 | YAML의 device override |
+| `--output-root PATH` | legacy | name/timestamp 출력 방식; `--run-dir`와 동시 사용 불가 |
+| `--smoke-test` | 검사 전용 | 1 epoch, split별 2 patch, worker 0으로 축소 |
 
 Train patch는 lesion component 단위로 sampling하며 희귀 class와 작은 병변을 oversample합니다.
 Negative patch의 일부는 vessel point를 중심으로 뽑아 혈관 주변 false positive를 학습합니다.
@@ -132,18 +171,34 @@ Negative patch의 일부는 vessel point를 중심으로 뽑아 혈관 주변 fa
 ```bash
 python scripts/predict.py \
   --image /path/to/case_0000.nii.gz \
-  --checkpoint "$RUN_DIR/model/checkpoint_best.pth" \
-  --output /path/to/predictions \
+  --run-dir "$RUN_DIR" \
   --device cuda
 ```
 
 출력은 다음과 같습니다.
 
 ```text
-predictions/
+$RUN_DIR/predictions/
 ├── task1_locations/<case>.json
 └── task2_masks/<case>.nii.gz
 ```
+
+Predict CLI 전체 계약:
+
+| argument | 필수 | 의미 |
+|---|---:|---|
+| `--image PATH` | 예 | 입력 NIfTI (`.nii` 또는 `.nii.gz`) |
+| `--run-dir PATH` | 권장 | best checkpoint와 prediction 출력 경로를 자동 선택 |
+| `--checkpoint PATH` | 조건부 | 기본값 `RUN_DIR/baseline/checkpoint_best.pth` |
+| `--output PATH` | 조건부 | 기본값 `RUN_DIR/predictions` |
+| `--modality ct\|mr` | 아니오 | 미지정 시 파일명에서 추론 |
+| `--device DEVICE` | 아니오 | 기본값 `cuda` |
+| `--overlap FLOAT` | 아니오 | 기본값 `0.5` |
+| `--mask-threshold FLOAT` | 아니오 | 기본값 `0.45` |
+| `--class-threshold FLOAT` | 아니오 | 기본값 `0.15` |
+| `--presence-threshold FLOAT` | 아니오 | 기본값 `0.35` |
+
+`--run-dir` 없이 추론할 때는 `--checkpoint`와 `--output`을 모두 지정해야 합니다.
 
 추론은 53채널 full-volume accumulator를 만들지 않고 overlap window별 최고 class confidence만
 보존하므로 메모리 사용량이 volume 크기에 대해 작습니다. Threshold는 validation에서 조정해야 하며,

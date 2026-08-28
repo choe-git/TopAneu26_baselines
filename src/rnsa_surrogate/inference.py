@@ -77,17 +77,34 @@ def sliding_window_predict(
                 )
                 image_patch = image[region][None]
                 coordinate_patch = coordinates[(slice(None), *region)]
-                modality_patch = np.full((1, *patch_size), modality_value, dtype=np.float32)
+                modality_patch = np.full(
+                    (1, *patch_size), modality_value, dtype=np.float32
+                )
                 inputs = np.concatenate([image_patch, modality_patch, coordinate_patch])
                 tensor = torch.from_numpy(inputs[None]).to(device)
-                with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                with torch.autocast(
+                    device.type, dtype=amp_dtype, enabled=amp_dtype is not None
+                ):
                     outputs = model(tensor)
 
-                binary = torch.sigmoid(outputs["aneurysm_logits"])[0, 0].float().cpu().numpy()
-                global_probability = torch.sigmoid(outputs["location_presence_logits"])[0].float()
-                global_scores = np.maximum(global_scores, global_probability.cpu().numpy())
-                location = torch.softmax(outputs["location_logits"], dim=1)[0, 1:].float()
-                location = location * (0.5 + 0.5 * global_probability[:, None, None, None])
+                binary = (
+                    torch.sigmoid(outputs["aneurysm_logits"])[0, 0]
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+                global_probability = torch.sigmoid(outputs["location_presence_logits"])[
+                    0
+                ].float()
+                global_scores = np.maximum(
+                    global_scores, global_probability.cpu().numpy()
+                )
+                location = torch.softmax(outputs["location_logits"], dim=1)[
+                    0, 1:
+                ].float()
+                location = location * (
+                    0.5 + 0.5 * global_probability[:, None, None, None]
+                )
                 class_score, class_index = location.max(dim=0)
                 class_score_array = class_score.cpu().numpy()
                 class_array = (class_index + 1).to(torch.uint8).cpu().numpy()
@@ -100,11 +117,15 @@ def sliding_window_predict(
 
     binary_probability = binary_sum / np.maximum(binary_count, 1)
     segmentation = best_class.copy()
-    segmentation[(binary_probability < mask_threshold) | (best_class_score < class_threshold)] = 0
+    segmentation[
+        (binary_probability < mask_threshold) | (best_class_score < class_threshold)
+    ] = 0
     segmentation = segmentation[crop]
     binary_probability = binary_probability[crop]
     best_class_score = best_class_score[crop]
-    task1 = {int(value) for value in np.flatnonzero(global_scores >= presence_threshold) + 1}
+    task1 = {
+        int(value) for value in np.flatnonzero(global_scores >= presence_threshold) + 1
+    }
     task1.update(int(value) for value in np.unique(segmentation) if value > 0)
     diagnostics = {
         "binary_probability": binary_probability,

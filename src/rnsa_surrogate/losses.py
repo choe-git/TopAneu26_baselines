@@ -30,7 +30,9 @@ def focal_tversky_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tens
     return (1.0 - score).mean()
 
 
-def asymmetric_multilabel_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def asymmetric_multilabel_loss(
+    logits: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
     target = target.to(logits.dtype)
     positive = torch.sigmoid(logits)
     negative = (1.0 - positive + 0.05).clamp(max=1.0)
@@ -44,9 +46,9 @@ def asymmetric_multilabel_loss(logits: torch.Tensor, target: torch.Tensor) -> to
 def vessel_loss(
     logits: torch.Tensor, target: torch.Tensor, valid_cases: torch.Tensor | None = None
 ) -> torch.Tensor:
-    target = F.interpolate(target[:, None].float(), size=logits.shape[2:], mode="nearest")[
-        :, 0
-    ].long()
+    target = F.interpolate(
+        target[:, None].float(), size=logits.shape[2:], mode="nearest"
+    )[:, 0].long()
     if valid_cases is None:
         valid_cases = torch.ones(target.shape[0], device=target.device)
     valid_cases = valid_cases.to(logits.dtype)
@@ -69,7 +71,9 @@ def vessel_loss(
     axes = (2, 3, 4)
     intersection = (foreground_probability * foreground_target).sum(axes)
     denominator = foreground_probability.sum(axes) + foreground_target.sum(axes)
-    dice = (1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0))[valid_cases > 0].mean()
+    dice = (1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0))[
+        valid_cases > 0
+    ].mean()
     return cross_entropy + dice
 
 
@@ -81,7 +85,9 @@ def multitask_loss(
     weights = weights or {}
     binary_target = (batch["location"] > 0).float()[:, None]
     binary = focal_tversky_loss(outputs["aneurysm_logits"], binary_target)
-    binary += F.binary_cross_entropy_with_logits(outputs["aneurysm_logits"], binary_target)
+    binary += F.binary_cross_entropy_with_logits(
+        outputs["aneurysm_logits"], binary_target
+    )
 
     flat_location = batch["location"].long()
     counts = torch.bincount(
@@ -89,13 +95,18 @@ def multitask_loss(
     ).float()
     class_weights = (counts + 1.0).rsqrt()
     class_weights[0] *= 0.05
-    location = F.cross_entropy(outputs["location_logits"], flat_location, weight=class_weights)
-    vessel = vessel_loss(outputs["vessel_logits"], batch["vessel"], batch.get("vessel_valid"))
+    location = F.cross_entropy(
+        outputs["location_logits"], flat_location, weight=class_weights
+    )
+    vessel = vessel_loss(
+        outputs["vessel_logits"], batch["vessel"], batch.get("vessel_valid")
+    )
     location_presence = asymmetric_multilabel_loss(
         outputs["location_presence_logits"], batch["location_presence"]
     )
     presence = F.binary_cross_entropy_with_logits(
-        outputs["aneurysm_presence_logits"].flatten(), batch["aneurysm_presence"].float()
+        outputs["aneurysm_presence_logits"].flatten(),
+        batch["aneurysm_presence"].float(),
     )
 
     total = (
