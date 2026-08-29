@@ -32,6 +32,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-threshold", type=float, default=0.45)
     parser.add_argument("--class-threshold", type=float, default=0.15)
     parser.add_argument("--presence-threshold", type=float, default=0.35)
+    parser.add_argument("--min-component-voxels", type=int, default=3)
+    parser.add_argument("--component-probability-threshold", type=float, default=0.55)
+    parser.add_argument("--component-class-threshold", type=float, default=0.25)
+    parser.add_argument("--component-top-fraction", type=float, default=0.25)
     return parser.parse_args()
 
 
@@ -90,6 +94,10 @@ def main() -> None:
         mask_threshold=args.mask_threshold,
         class_threshold=args.class_threshold,
         presence_threshold=args.presence_threshold,
+        min_component_voxels=args.min_component_voxels,
+        component_probability_threshold=args.component_probability_threshold,
+        component_class_threshold=args.component_class_threshold,
+        component_top_fraction=args.component_top_fraction,
     )
 
     task2_dir = output_dir / "task2_masks"

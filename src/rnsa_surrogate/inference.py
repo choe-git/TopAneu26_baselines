@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 import torch
+from scipy import ndimage
 
 
 def window_starts(length: int, patch: int, overlap: float) -> list[int]:
@@ -39,6 +42,81 @@ def _coordinate_volume(shape: tuple[int, int, int]) -> np.ndarray:
     return np.stack(np.meshgrid(*axes, indexing="ij"))
 
 
+def component_postprocess(
+    binary_probability: np.ndarray,
+    class_confidence: np.ndarray,
+    best_class: np.ndarray,
+    mask_threshold: float,
+    class_threshold: float,
+    min_component_voxels: int = 3,
+    component_probability_threshold: float = 0.55,
+    component_class_threshold: float = 0.25,
+    component_top_fraction: float = 0.25,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Filter voxel candidates and assign exactly one location to each component."""
+    if min_component_voxels <= 0:
+        raise ValueError("min_component_voxels must be positive")
+    if not 0.0 < component_top_fraction <= 1.0:
+        raise ValueError("component_top_fraction must be in (0, 1]")
+    for name, value in (
+        ("mask_threshold", mask_threshold),
+        ("class_threshold", class_threshold),
+        ("component_probability_threshold", component_probability_threshold),
+        ("component_class_threshold", component_class_threshold),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1], got {value}")
+
+    candidate = (binary_probability >= mask_threshold) & (
+        class_confidence >= class_threshold
+    )
+    connected, _ = ndimage.label(
+        candidate, structure=ndimage.generate_binary_structure(3, 1)
+    )
+    segmentation = np.zeros(best_class.shape, dtype=np.uint8)
+    records: list[dict[str, Any]] = []
+    for component_id, bounds in enumerate(ndimage.find_objects(connected), start=1):
+        if bounds is None:
+            continue
+        local_connected = connected[bounds]
+        component = local_connected == component_id
+        voxel_count = int(np.count_nonzero(component))
+        binary_values = binary_probability[bounds][component]
+        top_count = max(math.ceil(voxel_count * component_top_fraction), 1)
+        binary_score = float(
+            np.partition(binary_values, -top_count)[-top_count:].mean()
+        )
+
+        labels = best_class[bounds][component].astype(np.int64, copy=False)
+        weights = binary_values * class_confidence[bounds][component]
+        label_scores = np.bincount(labels, weights=weights, minlength=53)
+        label_scores[0] = 0.0
+        location = int(label_scores.argmax())
+        class_score = float(
+            label_scores[location] / max(float(binary_values.sum()), 1e-8)
+        )
+        accepted = (
+            voxel_count >= min_component_voxels
+            and binary_score >= component_probability_threshold
+            and class_score >= component_class_threshold
+            and location > 0
+        )
+        if accepted:
+            local_segmentation = segmentation[bounds]
+            local_segmentation[component] = location
+        records.append(
+            {
+                "component_id": component_id,
+                "voxels": voxel_count,
+                "binary_score": binary_score,
+                "class_score": class_score,
+                "location": location,
+                "accepted": accepted,
+            }
+        )
+    return segmentation, records
+
+
 @torch.inference_mode()
 def sliding_window_predict(
     model: torch.nn.Module,
@@ -51,7 +129,11 @@ def sliding_window_predict(
     mask_threshold: float = 0.45,
     class_threshold: float = 0.15,
     presence_threshold: float = 0.35,
-) -> tuple[np.ndarray, list[int], dict[str, np.ndarray]]:
+    min_component_voxels: int = 3,
+    component_probability_threshold: float = 0.55,
+    component_class_threshold: float = 0.25,
+    component_top_fraction: float = 0.25,
+) -> tuple[np.ndarray, list[int], dict[str, Any]]:
     patch_size = tuple(int(value) for value in patch_size)
     image, crop = _pad_to_patch(image_zyx.astype(np.float32, copy=False), patch_size)
     coordinates = _coordinate_volume(image.shape)
@@ -116,20 +198,29 @@ def sliding_window_predict(
                 best_class[region][replace] = class_array[replace]
 
     binary_probability = binary_sum / np.maximum(binary_count, 1)
-    segmentation = best_class.copy()
-    segmentation[
-        (binary_probability < mask_threshold) | (best_class_score < class_threshold)
-    ] = 0
-    segmentation = segmentation[crop]
     binary_probability = binary_probability[crop]
     best_class_score = best_class_score[crop]
-    task1 = {
-        int(value) for value in np.flatnonzero(global_scores >= presence_threshold) + 1
-    }
-    task1.update(int(value) for value in np.unique(segmentation) if value > 0)
+    best_class = best_class[crop]
+    segmentation, components = component_postprocess(
+        binary_probability,
+        best_class_score,
+        best_class,
+        mask_threshold,
+        class_threshold,
+        min_component_voxels,
+        component_probability_threshold,
+        component_class_threshold,
+        component_top_fraction,
+    )
+    task1 = sorted(
+        int(value)
+        for value in np.unique(segmentation)
+        if value > 0 and global_scores[int(value) - 1] >= presence_threshold
+    )
     diagnostics = {
         "binary_probability": binary_probability,
         "class_confidence": best_class_score,
         "global_location_scores": global_scores,
+        "components": components,
     }
-    return segmentation, sorted(task1), diagnostics
+    return segmentation, task1, diagnostics
