@@ -43,10 +43,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-threshold", type=float, default=0.45)
     parser.add_argument("--class-threshold", type=float, default=0.15)
     parser.add_argument("--presence-threshold", type=float, default=0.35)
-    parser.add_argument("--min-component-voxels", type=int, default=3)
-    parser.add_argument("--component-probability-threshold", type=float, default=0.55)
-    parser.add_argument("--component-class-threshold", type=float, default=0.25)
-    parser.add_argument("--component-top-fraction", type=float, default=0.25)
     parser.add_argument(
         "--save-predictions", action=argparse.BooleanOptionalAction, default=True
     )
@@ -225,10 +221,6 @@ def main() -> None:
             mask_threshold=args.mask_threshold,
             class_threshold=args.class_threshold,
             presence_threshold=args.presence_threshold,
-            min_component_voxels=args.min_component_voxels,
-            component_probability_threshold=args.component_probability_threshold,
-            component_class_threshold=args.component_class_threshold,
-            component_top_fraction=args.component_top_fraction,
         )
         truth_array = np.asarray(truth, dtype=np.uint8)
         prediction = np.asarray(prediction, dtype=np.uint8)
@@ -288,10 +280,6 @@ def main() -> None:
             "mask": args.mask_threshold,
             "class": args.class_threshold,
             "presence": args.presence_threshold,
-            "min_component_voxels": args.min_component_voxels,
-            "component_probability": args.component_probability_threshold,
-            "component_class": args.component_class_threshold,
-            "component_top_fraction": args.component_top_fraction,
         },
         "task1_case_label": task1,
         "task2_binary_voxel": task2_binary,
