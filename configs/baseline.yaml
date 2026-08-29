@@ -33,7 +33,11 @@ train:
   device: cuda
 loss:
   aneurysm: 1.0
-  location_seg: 0.5
+  location_exact: 0.25
+  location_territory: 0.15
+  location_side: 0.10
   vessel: 0.1
-  location_presence: 0.1
+  location_presence_exact: 0.05
+  location_presence_territory: 0.03
+  location_presence_side: 0.02
   aneurysm_presence: 0.05
