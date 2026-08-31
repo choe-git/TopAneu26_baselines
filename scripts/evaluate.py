@@ -1,4 +1,4 @@
-"""Evaluate one cached split with a trained RNSA surrogate checkpoint."""
+"""Evaluate a cached split using the official TopAneu-26 metric protocol."""
 
 from __future__ import annotations
 
@@ -10,18 +10,27 @@ from typing import Any
 
 import numpy as np
 import torch
-from scipy import ndimage
 from tqdm import tqdm
 
 from rnsa_surrogate.cache import (
     atomic_json_dump,
     atomic_save_npy,
     load_cache_index,
+    load_zyx,
+    resize_to_shape,
     sha256_file,
 )
 from rnsa_surrogate.inference import sliding_window_predict
 from rnsa_surrogate.model import RNSASurrogate
+from rnsa_surrogate.official_metrics import (
+    summarize_task1,
+    summarize_task2,
+    task1_case_counts,
+    task2_case_metrics,
+)
 from rnsa_surrogate.run_layout import BaselineRunLayout
+
+OFFICIAL_EVALUATION_URL = "https://github.com/Bangulli/TopAneu-26/tree/main/eval"
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path, help="Override baseline/evaluation/SPLIT"
+    )
+    parser.add_argument(
+        "--source", type=Path, help="Override original TopAneu release root"
     )
     parser.add_argument("--device", choices=("cuda", "cpu", "auto"), default="cuda")
     parser.add_argument("--overlap", type=float, default=0.5)
@@ -56,83 +68,17 @@ def safe_divide(numerator: float, denominator: float) -> float:
 
 def binary_metrics(tp: int, fp: int, fn: int, tn: int) -> dict[str, float | int]:
     denominator = math.sqrt(float((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)))
-    precision = safe_divide(tp, tp + fp)
-    recall = safe_divide(tp, tp + fn)
     return {
         "tp": int(tp),
         "fp": int(fp),
         "fn": int(fn),
         "tn": int(tn),
-        "precision": precision,
-        "recall": recall,
+        "precision": safe_divide(tp, tp + fp),
+        "recall": safe_divide(tp, tp + fn),
         "mcc": float((tp * tn - fp * fn) / denominator) if denominator > 0 else 0.0,
         "dice": safe_divide(2 * tp, 2 * tp + fp + fn),
         "iou": safe_divide(tp, tp + fp + fn),
     }
-
-
-def task1_counts(truth: set[int], prediction: set[int]) -> tuple[int, int, int, int]:
-    labels = set(range(1, 53))
-    return (
-        len(truth & prediction),
-        len(prediction - truth),
-        len(truth - prediction),
-        len(labels - truth - prediction),
-    )
-
-
-def confusion_metrics(confusion: np.ndarray) -> dict[str, Any]:
-    total = int(confusion.sum())
-    per_class: dict[str, dict[str, float | int]] = {}
-    active = []
-    for class_id in range(1, confusion.shape[0]):
-        tp = int(confusion[class_id, class_id])
-        fp = int(confusion[:, class_id].sum() - tp)
-        fn = int(confusion[class_id, :].sum() - tp)
-        tn = total - tp - fp - fn
-        if tp + fp + fn > 0:
-            active.append(class_id)
-            per_class[str(class_id)] = binary_metrics(tp, fp, fn, tn)
-
-    macro = {
-        name: float(np.mean([per_class[str(label)][name] for label in active]))
-        if active
-        else 0.0
-        for name in ("precision", "recall", "mcc", "dice", "iou")
-    }
-    true_counts = confusion.sum(axis=1).astype(np.float64)
-    predicted_counts = confusion.sum(axis=0).astype(np.float64)
-    correct = float(np.trace(confusion))
-    samples = float(confusion.sum())
-    numerator = correct * samples - float(np.dot(true_counts, predicted_counts))
-    denominator = math.sqrt(
-        max(samples**2 - float(np.dot(predicted_counts, predicted_counts)), 0.0)
-        * max(samples**2 - float(np.dot(true_counts, true_counts)), 0.0)
-    )
-    return {
-        "active_classes": active,
-        "macro": macro,
-        "multiclass_mcc": numerator / denominator if denominator > 0 else 0.0,
-        "voxel_accuracy": safe_divide(correct, samples),
-        "per_class": per_class,
-    }
-
-
-def lesion_counts(
-    prediction: np.ndarray, instances: np.ndarray
-) -> tuple[int, int, int]:
-    ground_truth_ids = {int(value) for value in np.unique(instances) if value > 0}
-    recalled_ids = {
-        int(value) for value in np.unique(instances[prediction > 0]) if value > 0
-    }
-    predicted_components, predicted_count = ndimage.label(
-        prediction > 0, structure=ndimage.generate_binary_structure(3, 1)
-    )
-    false_positives = 0
-    for component_id in range(1, predicted_count + 1):
-        if not np.any(instances[predicted_components == component_id] > 0):
-            false_positives += 1
-    return len(recalled_ids), len(ground_truth_ids), false_positives
 
 
 def load_model(
@@ -151,6 +97,19 @@ def load_model(
     return model.to(device).eval(), config
 
 
+def resolve_cache(layout: BaselineRunLayout) -> Path:
+    if (layout.cache / "index.json").is_file():
+        return layout.cache
+    inputs_path = layout.baseline / "inputs.json"
+    if not inputs_path.is_file():
+        raise FileNotFoundError(
+            f"Missing cache and training inputs metadata: {layout.cache}"
+        )
+    return Path(
+        json.loads(inputs_path.read_text(encoding="utf-8"))["cache_index"]
+    ).parent
+
+
 def main() -> None:
     args = parse_args()
     layout = BaselineRunLayout.from_root(args.run_dir)
@@ -162,12 +121,12 @@ def main() -> None:
     if metrics_path.exists() and not args.overwrite:
         raise FileExistsError(f"Evaluation already completed: {metrics_path}")
 
-    device_name = args.device
-    if device_name == "auto":
-        device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    if device_name == "cuda" and not torch.cuda.is_available():
+    requested_device = args.device
+    if requested_device == "auto":
+        requested_device = "cuda" if torch.cuda.is_available() else "cpu"
+    if requested_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    device = torch.device(device_name)
+    device = torch.device(requested_device)
     model, config = load_model(checkpoint_path, device)
     amp_name = str(config["train"].get("amp", "none"))
     amp_dtype = {
@@ -179,38 +138,32 @@ def main() -> None:
     if device.type != "cuda":
         amp_dtype = None
 
-    cache_path = layout.cache
-    if not (cache_path / "index.json").is_file():
-        inputs_path = layout.baseline / "inputs.json"
-        if not inputs_path.is_file():
-            raise FileNotFoundError(
-                f"Missing cache and training inputs metadata: {cache_path}"
-            )
-        cache_path = Path(
-            json.loads(inputs_path.read_text(encoding="utf-8"))["cache_index"]
-        ).parent
-    cache_index = load_cache_index(cache_path)
+    cache_index = load_cache_index(resolve_cache(layout))
     cases = [case for case in cache_index["cases"] if case["split"] == args.split]
     if not cases:
         raise ValueError(f"Cache contains no {args.split!r} cases")
     cache_root = Path(cache_index["index_path"]).parent
+    source_root = (args.source or Path(cache_index["source_root"])).resolve()
+    location_mask_root = source_root / "location_masks"
+    if not location_mask_root.is_dir():
+        raise FileNotFoundError(
+            f"Official-grid evaluation requires original masks: {location_mask_root}"
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     prediction_dir = output_dir / "predictions"
     location_dir = output_dir / "locations"
-
-    task1_totals = np.zeros(4, dtype=np.int64)
-    location_confusion = np.zeros((53, 53), dtype=np.int64)
+    task1_counts_per_case = []
+    task2_counts_per_case = []
+    task2_segmentation_per_case = []
     binary_totals = np.zeros(4, dtype=np.int64)
-    lesion_recalled = lesion_total = lesion_false_positives = 0
     per_case = []
 
     for case in tqdm(cases, desc=f"Evaluating {args.split}"):
         case_id = case["case_id"]
         case_dir = cache_root / case["cache_dir"]
         image = np.load(case_dir / "image.npy", mmap_mode="r").astype(np.float32)
-        truth = np.load(case_dir / "location.npy", mmap_mode="r")
-        instances = np.load(case_dir / "instances.npy", mmap_mode="r")
-        prediction, predicted_locations, _ = sliding_window_predict(
+        cache_prediction, predicted_locations, _ = sliding_window_predict(
             model,
             image,
             case["modality"],
@@ -222,52 +175,53 @@ def main() -> None:
             class_threshold=args.class_threshold,
             presence_threshold=args.presence_threshold,
         )
-        truth_array = np.asarray(truth, dtype=np.uint8)
-        prediction = np.asarray(prediction, dtype=np.uint8)
-        truth_locations = {int(value) for value in np.unique(truth_array) if value > 0}
-        predicted_location_set = set(predicted_locations)
-        task1_case_counts = task1_counts(truth_locations, predicted_location_set)
-        task1_totals += task1_case_counts
 
-        location_confusion += np.bincount(
-            truth_array.ravel().astype(np.int64) * 53 + prediction.ravel(),
-            minlength=53 * 53,
-        ).reshape(53, 53)
-        truth_binary = truth_array > 0
+        ground_truth, ground_truth_metadata = load_zyx(
+            location_mask_root / f"{case_id}.nii.gz"
+        )
+        expected_shape = tuple(case["original_metadata"]["shape_zyx"])
+        if ground_truth.shape != expected_shape:
+            raise ValueError(
+                f"Original shape mismatch for {case_id}: "
+                f"index={expected_shape}, mask={ground_truth.shape}"
+            )
+        prediction = resize_to_shape(cache_prediction, ground_truth.shape, order=0)
+        prediction = np.asarray(prediction, dtype=np.uint8)
+        ground_truth = np.asarray(ground_truth, dtype=np.uint8)
+
+        task1_counts_per_case.append(
+            task1_case_counts(case["json_locations"], predicted_locations)
+        )
+        task2_counts, task2_segmentation = task2_case_metrics(ground_truth, prediction)
+        task2_counts_per_case.append(task2_counts)
+        task2_segmentation_per_case.append(task2_segmentation)
+
+        truth_binary = ground_truth > 0
         prediction_binary = prediction > 0
         tp = int(np.count_nonzero(truth_binary & prediction_binary))
         fp = int(np.count_nonzero(~truth_binary & prediction_binary))
         fn = int(np.count_nonzero(truth_binary & ~prediction_binary))
         tn = int(np.count_nonzero(~truth_binary & ~prediction_binary))
-        binary_totals += (tp, fp, fn, tn)
-        recalled, total, false_positives = lesion_counts(prediction, instances)
-        lesion_recalled += recalled
-        lesion_total += total
-        lesion_false_positives += false_positives
-
-        case_payload = {
-            "case_id": case_id,
-            "modality": case["modality"],
-            "task1_truth": sorted(truth_locations),
-            "task1_prediction": sorted(predicted_location_set),
-            "task1": binary_metrics(*task1_case_counts),
-            "task2_binary": binary_metrics(tp, fp, fn, tn),
-            "lesions": {
-                "recalled": recalled,
-                "total": total,
-                "false_positive_components": false_positives,
-            },
-        }
-        per_case.append(case_payload)
+        binary_totals += tp, fp, fn, tn
+        per_case.append(
+            {
+                "case_id": case_id,
+                "modality": case["modality"],
+                "original_shape_zyx": list(ground_truth.shape),
+                "original_spacing_xyz": ground_truth_metadata["spacing_xyz"],
+                "task1_truth": [int(value) for value in case["json_locations"]],
+                "task1_prediction": [int(value) for value in predicted_locations],
+                "task2_binary_diagnostic": binary_metrics(tp, fp, fn, tn),
+            }
+        )
         atomic_json_dump(per_case, output_dir / "per_case_metrics.json")
         if args.save_predictions:
             atomic_save_npy(prediction_dir / f"{case_id}.npy", prediction)
             atomic_json_dump(
-                sorted(predicted_location_set), location_dir / f"{case_id}.json"
+                [int(value) for value in predicted_locations],
+                location_dir / f"{case_id}.json",
             )
 
-    task1 = binary_metrics(*(int(value) for value in task1_totals))
-    task2_binary = binary_metrics(*(int(value) for value in binary_totals))
     payload = {
         "split": args.split,
         "cases": len(cases),
@@ -275,25 +229,32 @@ def main() -> None:
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "cache_index": cache_index["index_path"],
         "cache_index_sha256": sha256_file(cache_index["index_path"]),
+        "source_root": str(source_root),
+        "evaluation_protocol": {
+            "name": "TopAneu-26 official metric port",
+            "reference": OFFICIAL_EVALUATION_URL,
+            "classes": 52,
+            "prediction_geometry": "original source mask grid",
+            "ranking_note": "Grand Challenge computes mean ranks across submissions",
+        },
         "thresholds": {
             "overlap": args.overlap,
             "mask": args.mask_threshold,
             "class": args.class_threshold,
             "presence": args.presence_threshold,
         },
-        "task1_case_label": task1,
-        "task2_binary_voxel": task2_binary,
-        "task2_location_voxel": confusion_metrics(location_confusion),
-        "lesion_detection": {
-            "recalled": lesion_recalled,
-            "total": lesion_total,
-            "recall": safe_divide(lesion_recalled, lesion_total),
-            "false_positive_components": lesion_false_positives,
-            "false_positives_per_case": safe_divide(lesion_false_positives, len(cases)),
+        "official_task1": summarize_task1(task1_counts_per_case),
+        "official_task2": summarize_task2(
+            task2_counts_per_case, task2_segmentation_per_case
+        ),
+        "diagnostics": {
+            "task2_binary_voxel": binary_metrics(
+                *(int(value) for value in binary_totals)
+            )
         },
     }
     atomic_json_dump(payload, metrics_path)
-    print(f"Evaluation metrics: {metrics_path}")
+    print(f"Official-equivalent evaluation metrics: {metrics_path}")
 
 
 if __name__ == "__main__":

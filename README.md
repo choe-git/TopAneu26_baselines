@@ -166,6 +166,28 @@ Train CLI 전체 계약:
 Train patch는 lesion component 단위로 sampling하며 희귀 class와 작은 병변을 oversample합니다.
 Negative patch의 일부는 vessel point를 중심으로 뽑아 혈관 주변 false positive를 학습합니다.
 
+## 공식 TopAneu-26 방식 평가
+
+`evaluate.py`는 [TopAneu-26 공식 evaluator](https://github.com/Bangulli/TopAneu-26/tree/main/eval)의
+계산식을 포트합니다. Task 1은 52개 위치별 Precision/Recall/MCC를 누적한 뒤 macro 평균하고, Task 2는
+case-location overlap 기반 Precision/Recall/MCC와 DSC, normalized HD95, Volumetric Similarity를 공식
+방식으로 집계합니다. Cache-grid prediction은 nearest-neighbor로 원본 NIfTI grid에 복원한 뒤 원본
+location mask와 비교합니다.
+
+```bash
+python scripts/evaluate.py \
+  --run-dir "$RUN_DIR" \
+  --split val \
+  --device cuda \
+  --no-save-predictions \
+  --overwrite
+```
+
+원본 데이터 위치는 cache index의 `source_root`를 사용합니다. 데이터가 이동했다면
+`--source /new/path/to/topaneu_release`로 지정합니다. 공식 macro 결과는 `metrics.json`의
+`official_task1.macro`와 `official_task2.macro`에 저장됩니다. `diagnostics.task2_binary_voxel`은
+threshold 분석을 위한 비공식 보조 지표이며 challenge ranking에는 사용되지 않습니다.
+
 ## 단일 volume 추론
 
 ```bash
