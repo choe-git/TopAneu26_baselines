@@ -19,7 +19,7 @@ model:
   vessel_classes: 37
   location_classes: 52
 train:
-  epochs: 200
+  epochs: 1000
   batch_size: 1
   accumulate_steps: 4
   learning_rate: 0.0003
