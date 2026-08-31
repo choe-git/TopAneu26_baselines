@@ -31,6 +31,12 @@ train:
   validate_every: 10
   test_every: 0
   device: cuda
+validation:
+  selection_task: task2
+  overlap: 0.5
+  mask_threshold: 0.45
+  class_threshold: 0.15
+  presence_threshold: 0.35
 loss:
   aneurysm: 1.0
   location_exact: 0.25

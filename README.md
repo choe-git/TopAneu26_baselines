@@ -126,16 +126,28 @@ RUN_DIR/
 │   ├── training_log.txt
 │   ├── checkpoint_latest.pth
 │   ├── checkpoint_best.pth
-│   └── metrics/{train,val,test}/epoch_XXXX.json
+│   ├── checkpoint_best_task1.pth
+│   ├── checkpoint_best_task2.pth
+│   └── metrics/{train,val,test,official_val}/epoch_XXXX.json
 ├── predictions/
 └── tensorboard/baseline/
 ```
 
 Prototype과 같은 `loss/train`, `loss/val` tag를 기록하고, 세부 loss component와 learning rate도
-별도 tag로 남깁니다. Validation과
-best checkpoint는 EMA weight로 계산하고, latest checkpoint에는 model/EMA/optimizer/scheduler/
-GradScaler/RNG state가 모두 들어갑니다. Prototype과 동일하게 validation 주기 및 마지막 epoch에만
-`checkpoint_latest.pth`를 원자적으로 갱신하며 epoch별 checkpoint는 만들지 않습니다.
+별도 tag로 남깁니다. Validation 주기마다 EMA weight로 전체 validation volume을 추론한 뒤 원본
+mask grid에서 공식 Task 1/Task 2 metric을 계산합니다. TensorBoard에는
+`official/val/task1/*`, `official/val/task2/*`와 `official/val/checkpoint_selection`이
+기록됩니다.
+
+Grand Challenge 최종 점수는 여러 제출의 metric별 rank 평균이므로 단일 학습 run에서는 직접
+계산할 수 없습니다. 따라서 checkpoint 선택에는 공식 metric의 방향 보정 평균을 사용합니다.
+Task 1은 `mean(precision, recall, MCC)`, Task 2는
+`mean(precision, recall, MCC, Dice, volumetric similarity, 1-HD95)`입니다.
+`validation.selection_task`의 기본값은 `task2`이며 그 최적점이
+`checkpoint_best.pth`가 됩니다. Task별 최적점도 `checkpoint_best_task1.pth`와
+`checkpoint_best_task2.pth`에 별도로 저장합니다. `checkpoint_latest.pth`에는
+model/EMA/optimizer/scheduler/GradScaler/RNG state가 모두 들어가며 validation 주기 및 마지막
+epoch에만 원자적으로 갱신합니다.
 
 ```bash
 tensorboard --logdir "$RUN_DIR/tensorboard/baseline"

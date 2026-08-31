@@ -108,9 +108,13 @@ def task2_case_metrics(
     ground_truth_classes = {int(value) for value in np.unique(ground_truth) if value}
     prediction_classes = {int(value) for value in np.unique(prediction) if value}
     number_of_aneurysms = len(ground_truth_classes)
+    counts[:, 3] = number_of_aneurysms
 
-    for class_index in range(N_CLASSES):
-        class_id = class_index + 1
+    # Classes absent from both volumes are official true negatives with zero
+    # segmentation contribution. Avoid creating 104 full-volume boolean arrays
+    # per case when only a handful of location classes are normally present.
+    for class_id in sorted(ground_truth_classes | prediction_classes):
+        class_index = class_id - 1
         in_ground_truth = class_id in ground_truth_classes
         in_prediction = class_id in prediction_classes
         gt_mask = ground_truth == class_id

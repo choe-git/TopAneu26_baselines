@@ -19,12 +19,21 @@ from tqdm import tqdm
 from rnsa_surrogate.cache import (
     atomic_json_dump,
     load_cache_index,
+    load_zyx,
+    resize_to_shape,
     sha256_file,
     validate_cache,
 )
 from rnsa_surrogate.data import CachedTopAneuPatchDataset
+from rnsa_surrogate.inference import sliding_window_predict
 from rnsa_surrogate.losses import multitask_loss
 from rnsa_surrogate.model import RNSASurrogate
+from rnsa_surrogate.official_metrics import (
+    summarize_task1,
+    summarize_task2,
+    task1_case_counts,
+    task2_case_metrics,
+)
 from rnsa_surrogate.run_layout import BaselineRunLayout, create_legacy_run
 from rnsa_surrogate.runtime import (
     ExponentialMovingAverage,
@@ -234,6 +243,133 @@ def write_metrics(
     )
 
 
+def official_selection_scores(
+    task1: dict[str, Any], task2: dict[str, Any]
+) -> dict[str, float]:
+    """Direction-adjusted means of official metrics for checkpoint selection.
+
+    The challenge score is a mean rank across submissions, so it cannot be computed
+    during one training run. These composites only select checkpoints; every
+    component is calculated with the official evaluator port.
+    """
+    task1_macro = task1["macro"]
+    task2_macro = task2["macro"]
+    return {
+        "task1": float(
+            np.mean(
+                [
+                    task1_macro["precision"],
+                    task1_macro["recall"],
+                    task1_macro["mcc"],
+                ]
+            )
+        ),
+        "task2": float(
+            np.mean(
+                [
+                    task2_macro["precision"],
+                    task2_macro["recall"],
+                    task2_macro["mcc"],
+                    task2_macro["dice"],
+                    task2_macro["volumetric_similarity"],
+                    1.0 - task2_macro["hd95"],
+                ]
+            )
+        ),
+    }
+
+
+@torch.inference_mode()
+def run_official_validation(
+    model: torch.nn.Module,
+    cache_index: dict[str, Any],
+    config: dict[str, Any],
+    device: torch.device,
+    dtype: torch.dtype | None,
+) -> dict[str, Any]:
+    """Run full-volume validation on the original mask grid."""
+    settings = config.get("validation", {})
+    cases = [case for case in cache_index["cases"] if case["split"] == "val"]
+    max_cases = int(settings.get("max_cases", 0))
+    if max_cases > 0:
+        cases = cases[:max_cases]
+    if not cases:
+        raise ValueError("Cache contains no validation cases")
+
+    cache_root = Path(cache_index["index_path"]).parent
+    location_mask_root = Path(cache_index["source_root"]).resolve() / "location_masks"
+    if not location_mask_root.is_dir():
+        raise FileNotFoundError(
+            "Official validation requires original masks: "
+            f"{location_mask_root}"
+        )
+
+    task1_counts_per_case = []
+    task2_counts_per_case = []
+    task2_segmentation_per_case = []
+    model.eval()
+    for case in tqdm(cases, desc="Official validation", leave=False):
+        case_dir = cache_root / case["cache_dir"]
+        image = np.load(case_dir / "image.npy", mmap_mode="r").astype(np.float32)
+        cache_prediction, predicted_locations, _ = sliding_window_predict(
+            model,
+            image,
+            case["modality"],
+            config["data"]["patch_size"],
+            device,
+            overlap=float(settings.get("overlap", 0.5)),
+            amp_dtype=dtype,
+            mask_threshold=float(settings.get("mask_threshold", 0.45)),
+            class_threshold=float(settings.get("class_threshold", 0.15)),
+            presence_threshold=float(settings.get("presence_threshold", 0.35)),
+        )
+        ground_truth, _ = load_zyx(
+            location_mask_root / f"{case['case_id']}.nii.gz"
+        )
+        expected_shape = tuple(case["original_metadata"]["shape_zyx"])
+        if ground_truth.shape != expected_shape:
+            raise ValueError(
+                f"Original shape mismatch for {case['case_id']}: "
+                f"index={expected_shape}, mask={ground_truth.shape}"
+            )
+        prediction = resize_to_shape(cache_prediction, ground_truth.shape, order=0)
+        prediction = np.asarray(prediction, dtype=np.uint8)
+        ground_truth = np.asarray(ground_truth, dtype=np.uint8)
+        task1_counts_per_case.append(
+            task1_case_counts(case["json_locations"], predicted_locations)
+        )
+        task2_counts, task2_segmentation = task2_case_metrics(
+            ground_truth, prediction
+        )
+        task2_counts_per_case.append(task2_counts)
+        task2_segmentation_per_case.append(task2_segmentation)
+
+    task1 = summarize_task1(task1_counts_per_case)
+    task2 = summarize_task2(task2_counts_per_case, task2_segmentation_per_case)
+    scores = official_selection_scores(task1, task2)
+    selection_task = str(settings.get("selection_task", "task2"))
+    if selection_task not in scores:
+        raise ValueError("validation.selection_task must be 'task1' or 'task2'")
+    return {
+        "cases": len(cases),
+        "official_task1": task1,
+        "official_task2": task2,
+        "checkpoint_selection": {
+            "task": selection_task,
+            "score": scores[selection_task],
+            "task1_score": scores["task1"],
+            "task2_score": scores["task2"],
+            "note": "direction-adjusted metric mean; official mean rank needs other submissions",
+        },
+        "thresholds": {
+            "overlap": float(settings.get("overlap", 0.5)),
+            "mask": float(settings.get("mask_threshold", 0.45)),
+            "class": float(settings.get("class_threshold", 0.15)),
+            "presence": float(settings.get("presence_threshold", 0.35)),
+        },
+    }
+
+
 def resolve_device(requested: str) -> torch.device:
     if requested == "auto":
         requested = "cuda" if torch.cuda.is_available() else "cpu"
@@ -255,6 +391,7 @@ def main() -> None:
         config["data"]["val_samples"] = 2
         config["data"]["test_samples"] = 2
         config["data"]["num_workers"] = 0
+        config.setdefault("validation", {})["max_cases"] = 1
 
     resume_path = args.resume.resolve() if args.resume is not None else None
     if args.run_dir is not None:
@@ -383,7 +520,14 @@ def main() -> None:
     ema = ExponentialMovingAverage(
         model, float(config["train"].get("ema_decay", 0.999))
     )
+    selection_task = str(config.get("validation", {}).get("selection_task", "task2"))
+    if selection_task not in {"task1", "task2"}:
+        raise ValueError("validation.selection_task must be 'task1' or 'task2'")
+    validation_signature = config_digest(config.get("validation", {}))
     start_epoch, best_validation = 0, float("inf")
+    best_official_score = float("-inf")
+    best_task1_score = float("-inf")
+    best_task2_score = float("-inf")
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -391,17 +535,31 @@ def main() -> None:
         scaler.load_state_dict(checkpoint["scaler"])
         ema.load_state_dict(checkpoint["ema"], device)
         start_epoch = int(checkpoint["epoch"])
-        best_validation = float(checkpoint["best_validation"])
+        best_validation = float(checkpoint.get("best_validation", float("inf")))
+        stored_selection_task = checkpoint.get("selection_task")
+        stored_validation_signature = checkpoint.get("validation_signature")
+        compatible_official_best = (
+            stored_selection_task == selection_task
+            and stored_validation_signature == validation_signature
+        )
+        if compatible_official_best:
+            best_official_score = float(
+                checkpoint.get("best_official_score", float("-inf"))
+            )
+            best_task1_score = float(
+                checkpoint.get("best_task1_score", float("-inf"))
+            )
+            best_task2_score = float(
+                checkpoint.get("best_task2_score", float("-inf"))
+            )
         restore_rng_state(checkpoint.get("rng"))
-        carried_best = (model_dir / "checkpoint_best.pth").is_file()
-        if not carried_best:
-            best_validation = float("inf")
         atomic_json_dump(
             {
                 "checkpoint": str(resume_path),
                 "start_epoch": start_epoch + 1,
-                "carried_best": carried_best,
-                "best_validation_reset": not carried_best,
+                "selection_task": selection_task,
+                "validation_signature": validation_signature,
+                "official_best_reset": not compatible_official_best,
                 "in_place": True,
             },
             model_dir / "resume.json",
@@ -446,15 +604,40 @@ def main() -> None:
 
             validate_every = int(config["train"].get("validate_every", 1))
             validation_metrics = None
+            official_validation = None
             if epoch % validate_every == 0 or epoch == epochs:
                 with ema.average_parameters(model):
                     validation_metrics = run_epoch(
                         model, val_loader, device, config["loss"], dtype, "validation"
                     )
+                    official_validation = run_official_validation(
+                        model, cache_index, config, device, dtype
+                    )
                 write_metrics(model_dir, "val", epoch, validation_metrics)
                 for name, value in validation_metrics.items():
                     writer.add_scalar(f"loss_components/val/{name}", value, epoch)
                 writer.add_scalar("loss/val", validation_metrics["total"], epoch)
+                atomic_json_dump(
+                    {
+                        "epoch": epoch,
+                        "split": "val",
+                        **official_validation,
+                    },
+                    model_dir
+                    / "metrics"
+                    / "official_val"
+                    / f"epoch_{epoch:04d}.json",
+                )
+                for task_name in ("task1", "task2"):
+                    macro = official_validation[f"official_{task_name}"]["macro"]
+                    for name, value in macro.items():
+                        writer.add_scalar(
+                            f"official/val/{task_name}/{name}", value, epoch
+                        )
+                selection = official_validation["checkpoint_selection"]
+                writer.add_scalar(
+                    "official/val/checkpoint_selection", selection["score"], epoch
+                )
 
             if test_loader is not None and (epoch % test_every == 0 or epoch == epochs):
                 with ema.average_parameters(model):
@@ -466,6 +649,28 @@ def main() -> None:
                     writer.add_scalar(f"loss_components/test/{name}", value, epoch)
                 writer.add_scalar("loss/test", test_metrics["total"], epoch)
 
+            selected_improved = False
+            task1_improved = False
+            task2_improved = False
+            if validation_metrics is not None:
+                best_validation = min(
+                    best_validation, float(validation_metrics["total"])
+                )
+            if official_validation is not None:
+                selection = official_validation["checkpoint_selection"]
+                selected_improved = selection["score"] > best_official_score
+                task1_improved = selection["task1_score"] > best_task1_score
+                task2_improved = selection["task2_score"] > best_task2_score
+                best_official_score = max(
+                    best_official_score, float(selection["score"])
+                )
+                best_task1_score = max(
+                    best_task1_score, float(selection["task1_score"])
+                )
+                best_task2_score = max(
+                    best_task2_score, float(selection["task2_score"])
+                )
+
             state = {
                 "stage": "baseline",
                 "epoch": epoch,
@@ -475,23 +680,34 @@ def main() -> None:
                 "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict(),
                 "best_validation": best_validation,
+                "selection_task": selection_task,
+                "validation_signature": validation_signature,
+                "best_official_score": best_official_score,
+                "best_task1_score": best_task1_score,
+                "best_task2_score": best_task2_score,
                 "config": config,
                 "contract_sha256": contract_sha256,
                 "cache_index_sha256": cache_report["index_sha256"],
                 "rng": rng_state(),
             }
-            if (
-                validation_metrics is not None
-                and validation_metrics["total"] < best_validation
-            ):
-                best_validation = validation_metrics["total"]
-                state["best_validation"] = best_validation
+            if selected_improved:
                 save_checkpoint(state, model_dir / "checkpoint_best.pth")
+            if task1_improved:
+                save_checkpoint(state, model_dir / "checkpoint_best_task1.pth")
+            if task2_improved:
+                save_checkpoint(state, model_dir / "checkpoint_best_task2.pth")
             if validation_metrics is not None or epoch == epochs:
                 save_checkpoint(state, model_dir / "checkpoint_latest.pth")
             message = f"Epoch {epoch}/{epochs}: train_loss={train_metrics['total']:.6f}"
             if validation_metrics is not None:
                 message += f", val_loss={validation_metrics['total']:.6f}"
+            if official_validation is not None:
+                selection = official_validation["checkpoint_selection"]
+                message += (
+                    f", official_{selection_task}={selection['score']:.6f}, "
+                    f"task1={selection['task1_score']:.6f}, "
+                    f"task2={selection['task2_score']:.6f}"
+                )
             message += f", time={perf_counter() - started:.1f}s"
             append_log(log_path, message)
             writer.flush()
@@ -501,6 +717,10 @@ def main() -> None:
             "completed",
             epochs=epochs,
             best_validation=best_validation,
+            selection_task=selection_task,
+            best_official_score=best_official_score,
+            best_task1_score=best_task1_score,
+            best_task2_score=best_task2_score,
             checkpoint=str(model_dir / "checkpoint_best.pth"),
         )
     except BaseException as error:
