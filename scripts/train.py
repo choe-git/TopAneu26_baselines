@@ -467,7 +467,7 @@ def main() -> None:
             or (
                 run_root
                 / "vessel_pretrain"
-                / f"fold_{args.fold}"
+                / "shared"
                 / "checkpoint_best.pth"
             )
         ).resolve()

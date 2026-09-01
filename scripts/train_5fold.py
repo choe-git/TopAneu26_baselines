@@ -1,4 +1,4 @@
-"""Run vessel pretraining and aneurysm fine-tuning for every ensemble fold."""
+"""Pretrain one shared vessel backbone, then fine-tune every aneurysm fold."""
 
 from __future__ import annotations
 
@@ -44,6 +44,23 @@ def main() -> None:
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     ensemble = config.get("ensemble", {})
     python = sys.executable
+    vessel_dir = layout.root / "vessel_pretrain" / "shared"
+    if not completed(vessel_dir):
+        command = [
+            python,
+            "scripts/pretrain_vessel.py",
+            "--run-dir",
+            str(layout.root),
+            "--config",
+            str(args.config),
+            "--device",
+            args.device,
+        ]
+        vessel_latest = vessel_dir / "checkpoint_latest.pth"
+        if vessel_latest.is_file():
+            command.extend(["--resume", str(vessel_latest)])
+        run(command)
+
     fold_manifest = layout.root / "folds.json"
     if not fold_manifest.is_file():
         run(
@@ -62,25 +79,8 @@ def main() -> None:
     if invalid:
         raise ValueError(f"Invalid folds: {invalid}")
 
+    shared_checkpoint = vessel_dir / "checkpoint_best.pth"
     for fold in selected:
-        vessel_dir = layout.root / "vessel_pretrain" / f"fold_{fold}"
-        if not completed(vessel_dir):
-            command = [
-                python,
-                "scripts/pretrain_vessel.py",
-                "--run-dir",
-                str(layout.root),
-                "--config",
-                str(args.config),
-                "--fold",
-                str(fold),
-                "--device",
-                args.device,
-            ]
-            vessel_latest = vessel_dir / "checkpoint_latest.pth"
-            if vessel_latest.is_file():
-                command.extend(["--resume", str(vessel_latest)])
-            run(command)
         fold_dir = layout.root / "folds" / f"fold_{fold}"
         if not completed(fold_dir):
             command = [
@@ -92,6 +92,8 @@ def main() -> None:
                 str(args.config),
                 "--fold",
                 str(fold),
+                "--pretrained",
+                str(shared_checkpoint),
                 "--device",
                 args.device,
             ]

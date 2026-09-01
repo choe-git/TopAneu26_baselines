@@ -113,12 +113,13 @@ checkpoint에 저장되며, 다른 cache/config로 잘못 resume하는 것도 �
 Kaggle RSNA 1st-place write-up의 핵심을 TopAneu의 52개 location과 37-class vessel annotation에
 맞춘 2-stage 경로입니다.
 
-1. 원래 test split을 완전히 제외하고 train+val case를 modality와 52개 location 기준으로
-   multilabel-stratified 5-fold로 나눕니다.
-2. 각 fold에서 validation case를 제외한 vessel mask로 residual 3D nnU-Net-style
-   encoder/decoder와 vessel head를 먼저 학습합니다.
-3. vessel EMA checkpoint의 encoder, decoder, half-resolution vessel head를 aneurysm 모델에
-   이식합니다.
+1. 기존 train/val split의 vessel mask로 residual 3D nnU-Net-style encoder/decoder와 vessel
+   head를 단 한 번 pretraining합니다. train split으로 최적화하고 val split의 vessel loss로
+   shared checkpoint를 선택합니다.
+2. Vessel pretraining이 끝난 뒤, 원래 test split을 완전히 제외한 train+val case를 modality와
+   52개 location 기준으로 multilabel-stratified 5-fold로 나눕니다.
+3. 동일한 shared vessel EMA checkpoint의 encoder, decoder, half-resolution vessel head를
+   5개 aneurysm fold 모델 모두에 이식합니다.
 4. 52개 vessel-region token을 학습하고 location-aware Transformer로 location presence를
    예측하면서 aneurysm sphere/location segmentation을 함께 fine-tuning합니다.
 5. test에서는 5개 fold의 voxel/location/presence 확률을 soft voting하고, 원본과 left-right
@@ -126,8 +127,8 @@ Kaggle RSNA 1st-place write-up의 핵심을 TopAneu의 52개 location과 37-clas
 
 여기서 nnU-Net-style은 외부 `nnUNetv2` CLI checkpoint를 불러오는 것이 아니라, 현재 cache와
 aneurysm 모델이 encoder/decoder weight를 직접 공유할 수 있도록 repo 내부에 구현한 residual
-3D U-Net pretraining stage를 의미합니다. Fold마다 vessel pretraining도 분리하므로 validation
-image의 vessel supervision이 해당 fold 학습에 들어가지 않습니다.
+3D U-Net pretraining stage를 의미합니다. Vessel pretraining 자체는 fold를 나누지 않으며,
+multilabel-stratified fold는 이후 aneurysm fine-tuning에만 적용됩니다.
 
 전체 과정은 한 명령으로 실행합니다.
 
@@ -140,13 +141,12 @@ python scripts/train_5fold.py \
   --no-save-predictions
 ```
 
-이 명령은 `folds.json` 생성, fold별 vessel pretraining, fold별 aneurysm fine-tuning, 5-fold
+이 명령은 shared vessel pretraining, `folds.json` 생성, fold별 aneurysm fine-tuning, 5-fold
 soft voting과 left-right TTA 공식 평가를 순차 실행합니다. 중단 후 같은 명령을 다시 실행하면
 완료된 stage는 건너뛰고 미완료 stage는 `checkpoint_latest.pth`에서 재개합니다.
 
-기본값은 fold별 vessel pretraining 1000 epoch와 fold별 aneurysm fine-tuning 150 epoch입니다.
-전체 학습량은 vessel stage 5000 epoch와 aneurysm stage 750 epoch이므로 실행 전에 충분한
-GPU 시간을 확보해야 합니다.
+기본값은 shared vessel pretraining 1000 epoch와 fold별 aneurysm fine-tuning 150 epoch입니다.
+전체 학습량은 vessel stage 1000 epoch와 aneurysm stage 750 epoch입니다.
 
 Kaggle write-up처럼 5개 중 4개 fold만 ensemble하려면 다음처럼 지정할 수 있습니다.
 
@@ -163,9 +163,9 @@ python scripts/train_5fold.py \
 ```text
 RUN_DIR/
 ├── folds.json
-├── vessel_pretrain/fold_0..4/checkpoint_best.pth
+├── vessel_pretrain/shared/checkpoint_best.pth
 ├── folds/fold_0..4/checkpoint_best.pth
-├── tensorboard/vessel_pretrain/fold_0..4/
+├── tensorboard/vessel_pretrain/shared/
 ├── tensorboard/folds/fold_0..4/
 └── ensemble/evaluation/test/metrics.json
 ```

@@ -1,9 +1,8 @@
-"""Fold-safe vessel U-Net pretraining before aneurysm fine-tuning."""
+"""Pretrain one shared vessel U-Net backbone before aneurysm cross-validation."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import math
 from collections.abc import Iterator
 from pathlib import Path
@@ -16,7 +15,7 @@ from torch.utils.data import DataLoader, Sampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from rnsa_surrogate.cache import atomic_json_dump, sha256_file, validate_cache
+from rnsa_surrogate.cache import atomic_json_dump, validate_cache
 from rnsa_surrogate.data import CachedTopAneuPatchDataset
 from rnsa_surrogate.losses import vessel_loss
 from rnsa_surrogate.model import VesselPretrainUNet
@@ -54,7 +53,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("configs/baseline.yaml"))
-    parser.add_argument("--fold", type=int, required=True)
     parser.add_argument("--device", choices=("cuda", "cpu", "auto"), default="cuda")
     parser.add_argument("--resume", type=Path)
     return parser.parse_args()
@@ -135,13 +133,7 @@ def main() -> None:
     settings = config.get("vessel_pretrain", {})
     layout = BaselineRunLayout.from_root(args.run_dir)
     cache_report = validate_cache(layout.cache, deep=False)
-    fold_manifest_path = layout.root / "folds.json"
-    folds = json.loads(fold_manifest_path.read_text(encoding="utf-8"))
-    if not 0 <= args.fold < int(folds["n_folds"]):
-        raise ValueError(f"Invalid fold {args.fold}")
-    val_ids = set(folds["folds"][str(args.fold)])
-    train_ids = set(folds["case_to_fold"]) - val_ids
-    output = layout.root / "vessel_pretrain" / f"fold_{args.fold}"
+    output = layout.root / "vessel_pretrain" / "shared"
     resume_path = args.resume.resolve() if args.resume is not None else None
     if resume_path is not None:
         if resume_path.parent != output.resolve():
@@ -159,13 +151,12 @@ def main() -> None:
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     device = torch.device(requested)
-    seed = int(config["experiment"].get("seed", 2026)) + args.fold
+    seed = int(config["experiment"].get("seed", 2026))
     seed_everything(seed)
     patch_size = tuple(config["data"]["patch_size"])
     train_dataset = CachedTopAneuPatchDataset(
         layout.cache,
-        split=None,
-        case_ids=train_ids,
+        split="train",
         patch_size=patch_size,
         samples=int(settings.get("train_samples", config["data"]["train_samples"])),
         positive_fraction=0.0,
@@ -175,8 +166,7 @@ def main() -> None:
     )
     val_dataset = CachedTopAneuPatchDataset(
         layout.cache,
-        split=None,
-        case_ids=val_ids,
+        split="val",
         patch_size=patch_size,
         samples=int(settings.get("val_samples", config["data"]["val_samples"])),
         positive_fraction=0.0,
@@ -213,8 +203,8 @@ def main() -> None:
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
         if checkpoint.get("stage") != "vessel_pretrain":
             raise ValueError(f"Not a vessel pretraining checkpoint: {resume_path}")
-        if int(checkpoint["fold"]) != args.fold:
-            raise ValueError("Resume checkpoint fold mismatch")
+        if checkpoint.get("scope") != "shared":
+            raise ValueError("Resume checkpoint is not a shared vessel pretraining run")
         if checkpoint["cache_index_sha256"] != cache_report["index_sha256"]:
             raise ValueError("Resume cache provenance differs")
         model.load_state_dict(checkpoint["model"])
@@ -226,7 +216,7 @@ def main() -> None:
         best = float(checkpoint["best_validation"])
         restore_rng_state(checkpoint.get("rng"))
     writer = SummaryWriter(
-        layout.root / "tensorboard" / "vessel_pretrain" / f"fold_{args.fold}",
+        layout.root / "tensorboard" / "vessel_pretrain" / "shared",
         purge_step=start_epoch + 1,
     )
     if resume_path is None:
@@ -234,17 +224,17 @@ def main() -> None:
         atomic_json_dump(environment_payload(), output / "environment.json")
         atomic_json_dump(
             {
-                "fold": args.fold,
-                "fold_manifest": str(fold_manifest_path),
-                "fold_manifest_sha256": sha256_file(fold_manifest_path),
+                "scope": "shared",
+                "training_split": "train",
+                "validation_split": "val",
                 "cache_index_sha256": cache_report["index_sha256"],
-                "train_cases": len(train_ids),
-                "val_cases": len(val_ids),
+                "train_cases": len(train_dataset.cases),
+                "val_cases": len(val_dataset.cases),
             },
             output / "inputs.json",
         )
     status = output / "status.json"
-    write_status(status, "running", fold=args.fold, device=str(device))
+    write_status(status, "running", scope="shared", device=str(device))
     try:
         for epoch in range(start_epoch + 1, epochs + 1):
             started = perf_counter()
@@ -270,7 +260,7 @@ def main() -> None:
             scheduler.step()
             state = {
                 "stage": "vessel_pretrain",
-                "fold": args.fold,
+                "scope": "shared",
                 "epoch": epoch,
                 "model": model.state_dict(),
                 "ema": ema.state_dict(),
@@ -295,7 +285,7 @@ def main() -> None:
         write_status(
             status,
             "completed",
-            fold=args.fold,
+            scope="shared",
             epochs=epochs,
             best_validation=best,
             checkpoint=str(output / "checkpoint_best.pth"),
