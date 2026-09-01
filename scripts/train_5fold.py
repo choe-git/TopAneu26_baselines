@@ -44,7 +44,7 @@ def main() -> None:
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     ensemble = config.get("ensemble", {})
     python = sys.executable
-    vessel_dir = layout.root / "vessel_pretrain" / "shared"
+    vessel_dir = layout.vessel_pretrain
     if not completed(vessel_dir):
         command = [
             python,
@@ -61,7 +61,7 @@ def main() -> None:
             command.extend(["--resume", str(vessel_latest)])
         run(command)
 
-    fold_manifest = layout.root / "folds.json"
+    fold_manifest = layout.fold_manifest
     if not fold_manifest.is_file():
         run(
             [
@@ -81,7 +81,7 @@ def main() -> None:
 
     shared_checkpoint = vessel_dir / "checkpoint_best.pth"
     for fold in selected:
-        fold_dir = layout.root / "folds" / f"fold_{fold}"
+        fold_dir = layout.folds / f"fold_{fold}"
         if not completed(fold_dir):
             command = [
                 python,

@@ -21,7 +21,7 @@ def main() -> None:
     args = parser.parse_args()
 
     layout = BaselineRunLayout.from_root(args.run_dir)
-    output = layout.root / "folds.json"
+    output = layout.fold_manifest
     if output.exists() and not args.overwrite:
         raise FileExistsError(output)
     index = load_cache_index(layout.cache)

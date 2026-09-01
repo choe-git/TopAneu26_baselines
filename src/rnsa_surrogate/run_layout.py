@@ -46,6 +46,22 @@ class BaselineRunLayout:
         return self.baseline / "checkpoint_best.pth"
 
     @property
+    def fold_manifest(self) -> Path:
+        return self.baseline / "folds.json"
+
+    @property
+    def vessel_pretrain(self) -> Path:
+        return self.baseline / "vessel_pretrain" / "shared"
+
+    @property
+    def folds(self) -> Path:
+        return self.baseline / "folds"
+
+    @property
+    def ensemble(self) -> Path:
+        return self.baseline / "ensemble"
+
+    @property
     def tensorboard(self) -> Path:
         return self.root / "tensorboard" / "baseline"
 

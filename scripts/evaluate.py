@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
         "--ensemble-folds",
         type=int,
         nargs="+",
-        help="Soft-vote RUN_DIR/folds/fold_N/checkpoint_best.pth",
+        help="Soft-vote RUN_DIR/baseline/folds/fold_N/checkpoint_best.pth",
     )
     parser.add_argument(
         "--tta-left-right",
@@ -132,14 +132,13 @@ def main() -> None:
             raise ValueError("--ensemble-folds contains duplicates")
         checkpoint_paths = [
             (
-                layout.root
-                / "folds"
+                layout.folds
                 / f"fold_{fold}"
                 / "checkpoint_best.pth"
             ).resolve()
             for fold in args.ensemble_folds
         ]
-        default_output = layout.root / "ensemble" / "evaluation" / args.split
+        default_output = layout.ensemble / "evaluation" / args.split
     else:
         checkpoint_paths = [(args.checkpoint or layout.checkpoint).resolve()]
         default_output = layout.baseline / "evaluation" / args.split

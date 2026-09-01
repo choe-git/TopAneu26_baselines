@@ -85,7 +85,9 @@ def parse_args() -> argparse.Namespace:
         "--resume", type=Path, help="Resume checkpoint_latest.pth in place"
     )
     parser.add_argument("--fold", type=int, help="Cross-validation fold index")
-    parser.add_argument("--folds-file", type=Path, help="Override RUN_DIR/folds.json")
+    parser.add_argument(
+        "--folds-file", type=Path, help="Override RUN_DIR/baseline/folds.json"
+    )
     parser.add_argument(
         "--pretrained", type=Path, help="Override fold vessel checkpoint"
     )
@@ -419,8 +421,8 @@ def main() -> None:
             model_dir = layout.baseline
             tensorboard_dir = layout.tensorboard
         else:
-            model_dir = layout.root / "folds" / f"fold_{args.fold}"
-            tensorboard_dir = layout.root / "tensorboard" / "folds" / f"fold_{args.fold}"
+            model_dir = layout.folds / f"fold_{args.fold}"
+            tensorboard_dir = layout.tensorboard / "folds" / f"fold_{args.fold}"
         if resume_path is not None and resume_path.parent != model_dir:
             raise ValueError(f"Resume checkpoint must be inside {model_dir}")
     else:
@@ -454,9 +456,7 @@ def main() -> None:
     fold_manifest_path: Path | None = None
     pretrained_path: Path | None = None
     if args.fold is not None:
-        fold_manifest_path = (
-            args.folds_file or (run_root / "folds.json")
-        ).resolve()
+        fold_manifest_path = (args.folds_file or layout.fold_manifest).resolve()
         fold_manifest = json.loads(fold_manifest_path.read_text(encoding="utf-8"))
         if not 0 <= args.fold < int(fold_manifest["n_folds"]):
             raise ValueError(f"Invalid fold {args.fold}")
@@ -464,12 +464,7 @@ def main() -> None:
         fold_train_ids = set(fold_manifest["case_to_fold"]) - fold_val_ids
         pretrained_path = (
             args.pretrained
-            or (
-                run_root
-                / "vessel_pretrain"
-                / "shared"
-                / "checkpoint_best.pth"
-            )
+            or (layout.vessel_pretrain / "checkpoint_best.pth")
         ).resolve()
         if resume_path is None and not pretrained_path.is_file():
             raise FileNotFoundError(

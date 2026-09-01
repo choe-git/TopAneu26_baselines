@@ -162,12 +162,17 @@ python scripts/train_5fold.py \
 
 ```text
 RUN_DIR/
-├── folds.json
-├── vessel_pretrain/shared/checkpoint_best.pth
-├── folds/fold_0..4/checkpoint_best.pth
-├── tensorboard/vessel_pretrain/shared/
-├── tensorboard/folds/fold_0..4/
-└── ensemble/evaluation/test/metrics.json
+├── cache/
+├── cache_report.json
+├── baseline/
+│   ├── folds.json
+│   ├── vessel_pretrain/shared/checkpoint_best.pth
+│   ├── folds/fold_0..4/checkpoint_best.pth
+│   └── ensemble/evaluation/test/metrics.json
+├── tensorboard/baseline/
+│   ├── vessel_pretrain/shared/
+│   └── folds/fold_0..4/
+└── pipeline.log
 ```
 
 ### Run과 logging 구조

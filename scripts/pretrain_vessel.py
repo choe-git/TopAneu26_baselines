@@ -133,7 +133,7 @@ def main() -> None:
     settings = config.get("vessel_pretrain", {})
     layout = BaselineRunLayout.from_root(args.run_dir)
     cache_report = validate_cache(layout.cache, deep=False)
-    output = layout.root / "vessel_pretrain" / "shared"
+    output = layout.vessel_pretrain
     resume_path = args.resume.resolve() if args.resume is not None else None
     if resume_path is not None:
         if resume_path.parent != output.resolve():
@@ -216,7 +216,7 @@ def main() -> None:
         best = float(checkpoint["best_validation"])
         restore_rng_state(checkpoint.get("rng"))
     writer = SummaryWriter(
-        layout.root / "tensorboard" / "vessel_pretrain" / "shared",
+        layout.tensorboard / "vessel_pretrain" / "shared",
         purge_step=start_epoch + 1,
     )
     if resume_path is None:
