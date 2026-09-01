@@ -108,6 +108,68 @@ python scripts/train.py \
 학습은 cache spacing과 config spacing이 다르면 실패합니다. Cache manifest SHA-256과 학습 계약은
 checkpoint에 저장되며, 다른 cache/config로 잘못 resume하는 것도 차단합니다.
 
+## Winner-inspired vessel pretraining + 5-fold ensemble
+
+Kaggle RSNA 1st-place write-up의 핵심을 TopAneu의 52개 location과 37-class vessel annotation에
+맞춘 2-stage 경로입니다.
+
+1. 원래 test split을 완전히 제외하고 train+val case를 modality와 52개 location 기준으로
+   multilabel-stratified 5-fold로 나눕니다.
+2. 각 fold에서 validation case를 제외한 vessel mask로 residual 3D nnU-Net-style
+   encoder/decoder와 vessel head를 먼저 학습합니다.
+3. vessel EMA checkpoint의 encoder, decoder, half-resolution vessel head를 aneurysm 모델에
+   이식합니다.
+4. 52개 vessel-region token을 학습하고 location-aware Transformer로 location presence를
+   예측하면서 aneurysm sphere/location segmentation을 함께 fine-tuning합니다.
+5. test에서는 5개 fold의 voxel/location/presence 확률을 soft voting하고, 원본과 left-right
+   flip 결과를 평균합니다. Flip 결과는 cache의 left/right label LUT로 원래 label에 복원합니다.
+
+여기서 nnU-Net-style은 외부 `nnUNetv2` CLI checkpoint를 불러오는 것이 아니라, 현재 cache와
+aneurysm 모델이 encoder/decoder weight를 직접 공유할 수 있도록 repo 내부에 구현한 residual
+3D U-Net pretraining stage를 의미합니다. Fold마다 vessel pretraining도 분리하므로 validation
+image의 vessel supervision이 해당 fold 학습에 들어가지 않습니다.
+
+전체 과정은 한 명령으로 실행합니다.
+
+```bash
+python scripts/train_5fold.py \
+  --run-dir "$RUN_DIR" \
+  --config configs/baseline.yaml \
+  --device cuda \
+  --split test \
+  --no-save-predictions
+```
+
+이 명령은 `folds.json` 생성, fold별 vessel pretraining, fold별 aneurysm fine-tuning, 5-fold
+soft voting과 left-right TTA 공식 평가를 순차 실행합니다. 중단 후 같은 명령을 다시 실행하면
+완료된 stage는 건너뛰고 미완료 stage는 `checkpoint_latest.pth`에서 재개합니다.
+
+기본값은 fold별 vessel pretraining 1000 epoch와 fold별 aneurysm fine-tuning 150 epoch입니다.
+전체 학습량은 vessel stage 5000 epoch와 aneurysm stage 750 epoch이므로 실행 전에 충분한
+GPU 시간을 확보해야 합니다.
+
+Kaggle write-up처럼 5개 중 4개 fold만 ensemble하려면 다음처럼 지정할 수 있습니다.
+
+```bash
+python scripts/train_5fold.py \
+  --run-dir "$RUN_DIR" \
+  --config configs/baseline.yaml \
+  --device cuda \
+  --folds 0 1 2 3
+```
+
+주요 출력은 다음과 같습니다.
+
+```text
+RUN_DIR/
+├── folds.json
+├── vessel_pretrain/fold_0..4/checkpoint_best.pth
+├── folds/fold_0..4/checkpoint_best.pth
+├── tensorboard/vessel_pretrain/fold_0..4/
+├── tensorboard/folds/fold_0..4/
+└── ensemble/evaluation/test/metrics.json
+```
+
 ### Run과 logging 구조
 
 ```text
@@ -128,16 +190,19 @@ RUN_DIR/
 │   ├── checkpoint_best.pth
 │   ├── checkpoint_best_task1.pth
 │   ├── checkpoint_best_task2.pth
-│   └── metrics/{train,val,test,official_val}/epoch_XXXX.json
+│   └── metrics/{train,test,official_val}/epoch_XXXX.json
 ├── predictions/
 └── tensorboard/baseline/
 ```
 
-Prototype과 같은 `loss/train`, `loss/val` tag를 기록하고, 세부 loss component와 learning rate도
-별도 tag로 남깁니다. Validation 주기마다 EMA weight로 전체 validation volume을 추론한 뒤 원본
+Aneurysm 학습은 `loss/train`, train loss component와 learning rate를 기록합니다. Patch
+`loss/val`은 checkpoint quality의 proxy로 사용하지 않으며 계산과 logging에서 제거했습니다.
+Validation 주기마다 EMA weight로 전체 validation volume을 추론한 뒤 원본
 mask grid에서 공식 Task 1/Task 2 metric을 계산합니다. TensorBoard에는
-`official/val/task1/*`, `official/val/task2/*`와 `official/val/checkpoint_selection`이
-기록됩니다.
+`metric/val`, `official/val/task1/*`, `official/val/task2/*`와
+`official/val/checkpoint_selection`이 기록됩니다. `metric/val`은
+`official/val/checkpoint_selection`과 같은 mean metric입니다. Vessel pretraining만은
+aneurysm 공식 metric이 없으므로 `loss/train`과 `loss/val`을 사용합니다.
 
 Grand Challenge 최종 점수는 여러 제출의 metric별 rank 평균이므로 단일 학습 run에서는 직접
 계산할 수 없습니다. 따라서 checkpoint 선택에는 공식 metric의 방향 보정 평균을 사용합니다.

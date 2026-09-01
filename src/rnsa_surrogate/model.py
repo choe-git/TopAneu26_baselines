@@ -119,6 +119,8 @@ class RNSASurrogate(nn.Module):
         levels: int = 4,
         vessel_classes: int = 37,
         location_classes: int = 52,
+        location_transformer_layers: int = 0,
+        location_transformer_heads: int = 4,
     ) -> None:
         super().__init__()
         if levels < 3:
@@ -136,7 +138,35 @@ class RNSASurrogate(nn.Module):
             nn.SiLU(inplace=True),
             nn.Dropout(0.15),
         )
-        self.location_presence = nn.Linear(channels[-1], location_classes)
+        self.location_transformer_layers = int(location_transformer_layers)
+        if self.location_transformer_layers > 0:
+            if channels[-1] % location_transformer_heads:
+                raise ValueError(
+                    "Bottleneck channels must be divisible by transformer heads"
+                )
+            self.location_vessel_attention = nn.Conv3d(
+                vessel_classes, location_classes, 1
+            )
+            self.location_projection = nn.Linear(channels[1], channels[-1])
+            self.location_embedding = nn.Parameter(
+                torch.zeros(1, location_classes, channels[-1])
+            )
+            nn.init.normal_(self.location_embedding, std=0.02)
+            layer = nn.TransformerEncoderLayer(
+                d_model=channels[-1],
+                nhead=location_transformer_heads,
+                dim_feedforward=channels[-1] * 2,
+                dropout=0.1,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.location_transformer = nn.TransformerEncoder(
+                layer, num_layers=self.location_transformer_layers
+            )
+            self.location_presence = nn.Linear(channels[-1], 1)
+        else:
+            self.location_presence = nn.Linear(channels[-1], location_classes)
         self.aneurysm_presence = nn.Linear(channels[-1], 1)
 
     def forward(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -154,10 +184,82 @@ class RNSASurrogate(nn.Module):
         average = F.adaptive_avg_pool3d(bottleneck, 1).flatten(1)
         maximum = F.adaptive_max_pool3d(bottleneck, 1).flatten(1)
         pooled = self.classifier(torch.cat([anatomy, average, maximum], dim=1))
+        if self.location_transformer_layers > 0:
+            attention = self.location_vessel_attention(
+                torch.softmax(vessel_logits.float(), dim=1)
+            )
+            attention = torch.softmax(attention.flatten(2), dim=-1)
+            location_features = torch.einsum(
+                "bcn,bln->blc", half.flatten(2), attention
+            )
+            location_tokens = (
+                self.location_projection(location_features)
+                + pooled[:, None]
+                + self.location_embedding
+            )
+            location_presence_logits = self.location_presence(
+                self.location_transformer(location_tokens)
+            ).squeeze(-1)
+        else:
+            location_presence_logits = self.location_presence(pooled)
+
         return {
             "aneurysm_logits": aneurysm_logits,
             "location_logits": location_logits,
             "vessel_logits": vessel_logits,
-            "location_presence_logits": self.location_presence(pooled),
+            "location_presence_logits": location_presence_logits,
             "aneurysm_presence_logits": self.aneurysm_presence(pooled),
         }
+
+
+class VesselPretrainUNet(nn.Module):
+    """Residual 3D U-Net used to pretrain anatomy-aware encoder/decoder weights."""
+
+    def __init__(
+        self,
+        in_channels: int = 5,
+        base_channels: int = 16,
+        levels: int = 4,
+        vessel_classes: int = 37,
+        **_: object,
+    ) -> None:
+        super().__init__()
+        channels = [base_channels * 2**index for index in range(levels)]
+        self.encoder = Encoder(in_channels, channels)
+        self.decoder = Decoder(channels)
+        self.vessel_head = nn.Conv3d(channels[1], vessel_classes, 1)
+        self.full_resolution_head = nn.Conv3d(channels[0], vessel_classes, 1)
+
+    def forward(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+        encoded = self.encoder(inputs)
+        decoded = self.decoder(encoded)
+        return {
+            "vessel_logits": self.full_resolution_head(decoded[0]),
+            "vessel_half_logits": self.vessel_head(decoded[1]),
+        }
+
+
+def load_vessel_pretraining(
+    model: RNSASurrogate, state: dict[str, torch.Tensor]
+) -> dict[str, int]:
+    """Transfer only shape-compatible U-Net encoder/decoder weights."""
+    target = model.state_dict()
+    transferred = {
+        name: value
+        for name, value in state.items()
+        if (
+            name.startswith("encoder.")
+            or name.startswith("decoder.")
+            or name.startswith("vessel_head.")
+        )
+        and name in target
+        and target[name].shape == value.shape
+    }
+    if not transferred:
+        raise ValueError("Vessel checkpoint has no compatible encoder/decoder weights")
+    target.update(transferred)
+    model.load_state_dict(target)
+    return {
+        "transferred_tensors": len(transferred),
+        "transferred_parameters": sum(value.numel() for value in transferred.values()),
+    }

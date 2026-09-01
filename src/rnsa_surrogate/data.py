@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Collection
 from functools import lru_cache
 from pathlib import Path
 
 import nibabel as nib
 import numpy as np
 import torch
+from scipy.ndimage import gaussian_filter
 from torch.utils.data import Dataset
 
 from .cache import load_cache_index
@@ -256,19 +258,30 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(
         self,
         cache_dir: str | Path,
-        split: str,
+        split: str | None,
         patch_size: tuple[int, int, int] = (64, 96, 96),
         samples: int = 1000,
         positive_fraction: float = 0.7,
         vessel_negative_fraction: float = 0.5,
         augment: bool = False,
         seed: int = 2026,
+        case_ids: Collection[str] | None = None,
     ) -> None:
         index = load_cache_index(cache_dir)
         self.cache_root = str(Path(index["index_path"]).parent)
-        self.cases = [case for case in index["cases"] if case["split"] == split]
+        if case_ids is None:
+            if split is None:
+                raise ValueError("Either split or case_ids must be provided")
+            self.cases = [case for case in index["cases"] if case["split"] == split]
+        else:
+            selected = set(case_ids)
+            available = {case["case_id"]: case for case in index["cases"]}
+            missing = sorted(selected - available.keys())
+            if missing:
+                raise ValueError(f"Unknown cache case IDs: {missing[:8]}")
+            self.cases = [available[case_id] for case_id in sorted(selected)]
         if not self.cases:
-            raise ValueError(f"No {split} cases in cache")
+            raise ValueError(f"No cases selected from cache (split={split!r})")
         self.patch_size = tuple(int(value) for value in patch_size)
         self.samples = int(samples)
         self.positive_fraction = float(positive_fraction)
@@ -374,6 +387,28 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
             )
             if rng.random() < 0.15:
                 inputs[0] += rng.normal(0, 0.03, self.patch_size).astype(np.float32)
+            if rng.random() < 0.15:
+                inputs[0] = gaussian_filter(
+                    inputs[0], sigma=float(rng.uniform(0.4, 0.9))
+                )
+            if rng.random() < 0.10:
+                smooth = gaussian_filter(
+                    inputs[0], sigma=float(rng.uniform(0.5, 1.0))
+                )
+                inputs[0] += float(rng.uniform(0.2, 0.6)) * (inputs[0] - smooth)
+            if rng.random() < 0.20:
+                gamma = float(rng.uniform(0.8, 1.2))
+                inputs[0] = np.sign(inputs[0]) * np.abs(inputs[0]) ** gamma
+            if rng.random() < 0.05:
+                inputs[0] *= -1.0
+            for spatial_axis, coordinate_channel in ((-3, 2), (-2, 3)):
+                if rng.random() < 0.15:
+                    inputs = np.flip(inputs, axis=spatial_axis).copy()
+                    inputs[coordinate_channel] *= -1.0
+                    location_patch = np.flip(
+                        location_patch, axis=spatial_axis
+                    ).copy()
+                    vessel_patch = np.flip(vessel_patch, axis=spatial_axis).copy()
             if rng.random() < 0.5:
                 inputs = np.flip(inputs, axis=-1).copy()
                 inputs[4] *= -1.0

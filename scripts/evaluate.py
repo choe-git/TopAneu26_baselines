@@ -20,7 +20,7 @@ from rnsa_surrogate.cache import (
     resize_to_shape,
     sha256_file,
 )
-from rnsa_surrogate.inference import sliding_window_predict
+from rnsa_surrogate.inference import ensemble_sliding_window_predict
 from rnsa_surrogate.model import RNSASurrogate
 from rnsa_surrogate.official_metrics import (
     summarize_task1,
@@ -43,6 +43,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=("train", "val", "test"), default="test")
     parser.add_argument(
         "--checkpoint", type=Path, help="Override baseline/checkpoint_best.pth"
+    )
+    parser.add_argument(
+        "--ensemble-folds",
+        type=int,
+        nargs="+",
+        help="Soft-vote RUN_DIR/folds/fold_N/checkpoint_best.pth",
+    )
+    parser.add_argument(
+        "--tta-left-right",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Average original and left-right flipped probabilities",
     )
     parser.add_argument(
         "--output", type=Path, help="Override baseline/evaluation/SPLIT"
@@ -85,8 +97,8 @@ def load_model(
     checkpoint_path: Path, device: torch.device
 ) -> tuple[RNSASurrogate, dict[str, Any]]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if checkpoint.get("stage", "baseline") != "baseline":
-        raise ValueError(f"Not a baseline checkpoint: {checkpoint.get('stage')}")
+    if checkpoint.get("stage", "baseline") not in {"baseline", "aneurysm_fold"}:
+        raise ValueError(f"Not an aneurysm checkpoint: {checkpoint.get('stage')}")
     config = checkpoint["config"]
     model = RNSASurrogate(**config["model"])
     state = dict(checkpoint["model"])
@@ -113,11 +125,29 @@ def resolve_cache(layout: BaselineRunLayout) -> Path:
 def main() -> None:
     args = parse_args()
     layout = BaselineRunLayout.from_root(args.run_dir)
-    checkpoint_path = (args.checkpoint or layout.checkpoint).resolve()
-    output_dir = (args.output or layout.baseline / "evaluation" / args.split).resolve()
+    if args.checkpoint is not None and args.ensemble_folds is not None:
+        raise ValueError("Use either --checkpoint or --ensemble-folds")
+    if args.ensemble_folds is not None:
+        if len(set(args.ensemble_folds)) != len(args.ensemble_folds):
+            raise ValueError("--ensemble-folds contains duplicates")
+        checkpoint_paths = [
+            (
+                layout.root
+                / "folds"
+                / f"fold_{fold}"
+                / "checkpoint_best.pth"
+            ).resolve()
+            for fold in args.ensemble_folds
+        ]
+        default_output = layout.root / "ensemble" / "evaluation" / args.split
+    else:
+        checkpoint_paths = [(args.checkpoint or layout.checkpoint).resolve()]
+        default_output = layout.baseline / "evaluation" / args.split
+    output_dir = (args.output or default_output).resolve()
     metrics_path = output_dir / "metrics.json"
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(checkpoint_path)
+    missing_checkpoints = [path for path in checkpoint_paths if not path.is_file()]
+    if missing_checkpoints:
+        raise FileNotFoundError(missing_checkpoints[0])
     if metrics_path.exists() and not args.overwrite:
         raise FileExistsError(f"Evaluation already completed: {metrics_path}")
 
@@ -127,7 +157,11 @@ def main() -> None:
     if requested_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     device = torch.device(requested_device)
-    model, config = load_model(checkpoint_path, device)
+    loaded = [load_model(path, device) for path in checkpoint_paths]
+    models = [item[0] for item in loaded]
+    config = loaded[0][1]
+    if any(item[1]["model"] != config["model"] for item in loaded[1:]):
+        raise ValueError("Ensemble checkpoints use different model configurations")
     amp_name = str(config["train"].get("amp", "none"))
     amp_dtype = {
         "bf16": torch.bfloat16,
@@ -163,8 +197,8 @@ def main() -> None:
         case_id = case["case_id"]
         case_dir = cache_root / case["cache_dir"]
         image = np.load(case_dir / "image.npy", mmap_mode="r").astype(np.float32)
-        cache_prediction, predicted_locations, _ = sliding_window_predict(
-            model,
+        cache_prediction, predicted_locations, _ = ensemble_sliding_window_predict(
+            models,
             image,
             case["modality"],
             config["data"]["patch_size"],
@@ -174,6 +208,8 @@ def main() -> None:
             mask_threshold=args.mask_threshold,
             class_threshold=args.class_threshold,
             presence_threshold=args.presence_threshold,
+            tta_left_right=args.tta_left_right,
+            location_lr_swap=cache_index["location_lr_swap"],
         )
 
         ground_truth, ground_truth_metadata = load_zyx(
@@ -225,8 +261,16 @@ def main() -> None:
     payload = {
         "split": args.split,
         "cases": len(cases),
-        "checkpoint": str(checkpoint_path),
-        "checkpoint_sha256": sha256_file(checkpoint_path),
+        "checkpoint": (
+            str(checkpoint_paths[0]) if len(checkpoint_paths) == 1 else None
+        ),
+        "checkpoint_sha256": (
+            sha256_file(checkpoint_paths[0])
+            if len(checkpoint_paths) == 1
+            else None
+        ),
+        "checkpoints": [str(path) for path in checkpoint_paths],
+        "checkpoint_sha256s": [sha256_file(path) for path in checkpoint_paths],
         "cache_index": cache_index["index_path"],
         "cache_index_sha256": sha256_file(cache_index["index_path"]),
         "source_root": str(source_root),
@@ -242,6 +286,12 @@ def main() -> None:
             "mask": args.mask_threshold,
             "class": args.class_threshold,
             "presence": args.presence_threshold,
+        },
+        "inference": {
+            "soft_voting_folds": args.ensemble_folds,
+            "models": len(models),
+            "left_right_tta": args.tta_left_right,
+            "probability_members": len(models) * (2 if args.tta_left_right else 1),
         },
         "official_task1": summarize_task1(task1_counts_per_case),
         "official_task2": summarize_task2(

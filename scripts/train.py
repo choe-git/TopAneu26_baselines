@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from collections.abc import Iterator
 from pathlib import Path
@@ -27,7 +28,7 @@ from rnsa_surrogate.cache import (
 from rnsa_surrogate.data import CachedTopAneuPatchDataset
 from rnsa_surrogate.inference import sliding_window_predict
 from rnsa_surrogate.losses import multitask_loss
-from rnsa_surrogate.model import RNSASurrogate
+from rnsa_surrogate.model import RNSASurrogate, load_vessel_pretraining
 from rnsa_surrogate.official_metrics import (
     summarize_task1,
     summarize_task2,
@@ -83,6 +84,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume", type=Path, help="Resume checkpoint_latest.pth in place"
     )
+    parser.add_argument("--fold", type=int, help="Cross-validation fold index")
+    parser.add_argument("--folds-file", type=Path, help="Override RUN_DIR/folds.json")
+    parser.add_argument(
+        "--pretrained", type=Path, help="Override fold vessel checkpoint"
+    )
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args()
 
@@ -122,10 +128,11 @@ def training_contract(config: dict[str, Any]) -> dict[str, Any]:
 def make_dataset(
     config: dict[str, Any],
     cache_dir: Path,
-    split: str,
+    split: str | None,
     samples: int,
     augment: bool,
     seed: int,
+    case_ids: set[str] | None = None,
 ) -> CachedTopAneuPatchDataset:
     data = config["data"]
     return CachedTopAneuPatchDataset(
@@ -137,6 +144,7 @@ def make_dataset(
         vessel_negative_fraction=float(data["vessel_negative_fraction"]),
         augment=augment,
         seed=seed,
+        case_ids=case_ids,
     )
 
 
@@ -286,10 +294,19 @@ def run_official_validation(
     config: dict[str, Any],
     device: torch.device,
     dtype: torch.dtype | None,
+    case_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Run full-volume validation on the original mask grid."""
     settings = config.get("validation", {})
-    cases = [case for case in cache_index["cases"] if case["split"] == "val"]
+    cases = [
+        case
+        for case in cache_index["cases"]
+        if (
+            case["case_id"] in case_ids
+            if case_ids is not None
+            else case["split"] == "val"
+        )
+    ]
     max_cases = int(settings.get("max_cases", 0))
     if max_cases > 0:
         cases = cases[:max_cases]
@@ -398,11 +415,17 @@ def main() -> None:
         layout = BaselineRunLayout.from_root(args.run_dir)
         run_root = layout.root
         cache_dir = (args.cache or layout.cache).resolve()
-        model_dir = layout.baseline
-        tensorboard_dir = layout.tensorboard
+        if args.fold is None:
+            model_dir = layout.baseline
+            tensorboard_dir = layout.tensorboard
+        else:
+            model_dir = layout.root / "folds" / f"fold_{args.fold}"
+            tensorboard_dir = layout.root / "tensorboard" / "folds" / f"fold_{args.fold}"
         if resume_path is not None and resume_path.parent != model_dir:
             raise ValueError(f"Resume checkpoint must be inside {model_dir}")
     else:
+        if args.fold is not None:
+            raise ValueError("--fold requires --run-dir")
         if args.cache is None:
             raise ValueError("--cache is required when --run-dir is not used")
         cache_dir = args.cache.resolve()
@@ -416,7 +439,7 @@ def main() -> None:
         tensorboard_dir = model_dir / "tensorboard"
     status_path = model_dir / "status.json"
 
-    seed = int(config["experiment"].get("seed", 2026))
+    seed = int(config["experiment"].get("seed", 2026)) + (args.fold or 0)
     seed_everything(seed)
     device = resolve_device(str(config["train"].get("device", "cuda")))
     cache_report = validate_cache(cache_dir, deep=False)
@@ -426,14 +449,51 @@ def main() -> None:
     ):
         raise ValueError("Cache spacing differs from data.target_spacing_zyx")
 
+    fold_train_ids: set[str] | None = None
+    fold_val_ids: set[str] | None = None
+    fold_manifest_path: Path | None = None
+    pretrained_path: Path | None = None
+    if args.fold is not None:
+        fold_manifest_path = (
+            args.folds_file or (run_root / "folds.json")
+        ).resolve()
+        fold_manifest = json.loads(fold_manifest_path.read_text(encoding="utf-8"))
+        if not 0 <= args.fold < int(fold_manifest["n_folds"]):
+            raise ValueError(f"Invalid fold {args.fold}")
+        fold_val_ids = set(fold_manifest["folds"][str(args.fold)])
+        fold_train_ids = set(fold_manifest["case_to_fold"]) - fold_val_ids
+        pretrained_path = (
+            args.pretrained
+            or (
+                run_root
+                / "vessel_pretrain"
+                / f"fold_{args.fold}"
+                / "checkpoint_best.pth"
+            )
+        ).resolve()
+        if resume_path is None and not pretrained_path.is_file():
+            raise FileNotFoundError(
+                f"Fold training requires vessel pretraining: {pretrained_path}"
+            )
+
     contract = training_contract(config)
+    if args.fold is not None:
+        assert fold_manifest_path is not None
+        contract["cross_validation"] = {
+            "fold": args.fold,
+            "fold_manifest_sha256": sha256_file(fold_manifest_path),
+            "pretrained_sha256": (
+                sha256_file(pretrained_path) if pretrained_path is not None else None
+            ),
+        }
     contract_sha256 = config_digest(contract)
     checkpoint: dict[str, Any] | None = None
     if resume_path is not None:
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
-        if checkpoint.get("stage", "baseline") != "baseline":
+        expected_stage = "aneurysm_fold" if args.fold is not None else "baseline"
+        if checkpoint.get("stage", "baseline") != expected_stage:
             raise ValueError(
-                f"Checkpoint stage is not baseline: {checkpoint.get('stage')}"
+                f"Checkpoint stage is not {expected_stage}: {checkpoint.get('stage')}"
             )
         if checkpoint["contract_sha256"] != contract_sha256:
             raise ValueError("Resume training contract differs from checkpoint")
@@ -445,7 +505,7 @@ def main() -> None:
             if model_dir.exists() and any(model_dir.iterdir()):
                 raise FileExistsError(f"Baseline run already exists: {model_dir}")
             run_root.mkdir(parents=True, exist_ok=True)
-            model_dir.mkdir(parents=False, exist_ok=False)
+            model_dir.mkdir(parents=True, exist_ok=False)
         atomic_json_dump(config, model_dir / "config.json")
         atomic_json_dump(environment_payload(), model_dir / "environment.json")
         atomic_json_dump(
@@ -455,6 +515,13 @@ def main() -> None:
                 "config_source": str(args.config.resolve()),
                 "config_source_sha256": sha256_file(args.config),
                 "contract_sha256": contract_sha256,
+                "fold": args.fold,
+                "fold_manifest": (
+                    str(fold_manifest_path) if fold_manifest_path is not None else None
+                ),
+                "pretrained_checkpoint": (
+                    str(pretrained_path) if pretrained_path is not None else None
+                ),
             },
             model_dir / "inputs.json",
         )
@@ -473,9 +540,14 @@ def main() -> None:
     train_samples = int(config["data"]["train_samples"])
     val_samples = int(config["data"]["val_samples"])
     test_samples = int(config["data"].get("test_samples", val_samples))
-    train_dataset = make_dataset(config, cache_dir, "train", train_samples, True, seed)
-    val_dataset = make_dataset(
-        config, cache_dir, "val", val_samples, False, seed + 10_000_000
+    train_dataset = make_dataset(
+        config,
+        cache_dir,
+        "train" if fold_train_ids is None else None,
+        train_samples,
+        True,
+        seed,
+        fold_train_ids,
     )
     test_every = int(config["train"].get("test_every", 0))
     test_dataset = (
@@ -485,7 +557,6 @@ def main() -> None:
     )
     train_sampler = EpochIndexSampler(len(train_dataset))
     train_loader = make_loader(train_dataset, config, device, sampler=train_sampler)
-    val_loader = make_loader(val_dataset, config, device)
     test_loader = (
         make_loader(
             test_dataset,
@@ -498,6 +569,24 @@ def main() -> None:
     )
 
     model = RNSASurrogate(**config["model"]).to(device)
+    if checkpoint is None and pretrained_path is not None:
+        vessel_checkpoint = torch.load(
+            pretrained_path, map_location="cpu", weights_only=False
+        )
+        if vessel_checkpoint.get("stage") != "vessel_pretrain":
+            raise ValueError(f"Not a vessel pretraining checkpoint: {pretrained_path}")
+        pretrained_state = dict(vessel_checkpoint["model"])
+        if "ema" in vessel_checkpoint:
+            pretrained_state.update(vessel_checkpoint["ema"]["shadow"])
+        transfer = load_vessel_pretraining(model, pretrained_state)
+        atomic_json_dump(
+            {
+                "checkpoint": str(pretrained_path),
+                "checkpoint_sha256": sha256_file(pretrained_path),
+                **transfer,
+            },
+            model_dir / "pretraining.json",
+        )
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     atomic_json_dump({"parameters": parameter_count}, model_dir / "model.json")
     optimizer = torch.optim.AdamW(
@@ -505,7 +594,11 @@ def main() -> None:
         lr=float(config["train"]["learning_rate"]),
         weight_decay=float(config["train"]["weight_decay"]),
     )
-    epochs = int(config["train"]["epochs"])
+    epochs = int(
+        config.get("ensemble", {}).get("fold_epochs", config["train"]["epochs"])
+        if args.fold is not None
+        else config["train"]["epochs"]
+    )
     accumulate = int(config["train"]["accumulate_steps"])
     updates_per_epoch = math.ceil(len(train_loader) / accumulate)
     scheduler = scheduler_for(
@@ -524,7 +617,7 @@ def main() -> None:
     if selection_task not in {"task1", "task2"}:
         raise ValueError("validation.selection_task must be 'task1' or 'task2'")
     validation_signature = config_digest(config.get("validation", {}))
-    start_epoch, best_validation = 0, float("inf")
+    start_epoch = 0
     best_official_score = float("-inf")
     best_task1_score = float("-inf")
     best_task2_score = float("-inf")
@@ -535,7 +628,6 @@ def main() -> None:
         scaler.load_state_dict(checkpoint["scaler"])
         ema.load_state_dict(checkpoint["ema"], device)
         start_epoch = int(checkpoint["epoch"])
-        best_validation = float(checkpoint.get("best_validation", float("inf")))
         stored_selection_task = checkpoint.get("selection_task")
         stored_validation_signature = checkpoint.get("validation_signature")
         compatible_official_best = (
@@ -603,20 +695,17 @@ def main() -> None:
             )
 
             validate_every = int(config["train"].get("validate_every", 1))
-            validation_metrics = None
             official_validation = None
             if epoch % validate_every == 0 or epoch == epochs:
                 with ema.average_parameters(model):
-                    validation_metrics = run_epoch(
-                        model, val_loader, device, config["loss"], dtype, "validation"
-                    )
                     official_validation = run_official_validation(
-                        model, cache_index, config, device, dtype
+                        model,
+                        cache_index,
+                        config,
+                        device,
+                        dtype,
+                        fold_val_ids,
                     )
-                write_metrics(model_dir, "val", epoch, validation_metrics)
-                for name, value in validation_metrics.items():
-                    writer.add_scalar(f"loss_components/val/{name}", value, epoch)
-                writer.add_scalar("loss/val", validation_metrics["total"], epoch)
                 atomic_json_dump(
                     {
                         "epoch": epoch,
@@ -635,6 +724,7 @@ def main() -> None:
                             f"official/val/{task_name}/{name}", value, epoch
                         )
                 selection = official_validation["checkpoint_selection"]
+                writer.add_scalar("metric/val", selection["score"], epoch)
                 writer.add_scalar(
                     "official/val/checkpoint_selection", selection["score"], epoch
                 )
@@ -652,10 +742,6 @@ def main() -> None:
             selected_improved = False
             task1_improved = False
             task2_improved = False
-            if validation_metrics is not None:
-                best_validation = min(
-                    best_validation, float(validation_metrics["total"])
-                )
             if official_validation is not None:
                 selection = official_validation["checkpoint_selection"]
                 selected_improved = selection["score"] > best_official_score
@@ -672,14 +758,14 @@ def main() -> None:
                 )
 
             state = {
-                "stage": "baseline",
+                "stage": "aneurysm_fold" if args.fold is not None else "baseline",
+                "fold": args.fold,
                 "epoch": epoch,
                 "model": model.state_dict(),
                 "ema": ema.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict(),
-                "best_validation": best_validation,
                 "selection_task": selection_task,
                 "validation_signature": validation_signature,
                 "best_official_score": best_official_score,
@@ -696,11 +782,9 @@ def main() -> None:
                 save_checkpoint(state, model_dir / "checkpoint_best_task1.pth")
             if task2_improved:
                 save_checkpoint(state, model_dir / "checkpoint_best_task2.pth")
-            if validation_metrics is not None or epoch == epochs:
+            if official_validation is not None or epoch == epochs:
                 save_checkpoint(state, model_dir / "checkpoint_latest.pth")
             message = f"Epoch {epoch}/{epochs}: train_loss={train_metrics['total']:.6f}"
-            if validation_metrics is not None:
-                message += f", val_loss={validation_metrics['total']:.6f}"
             if official_validation is not None:
                 selection = official_validation["checkpoint_selection"]
                 message += (
@@ -716,7 +800,6 @@ def main() -> None:
             status_path,
             "completed",
             epochs=epochs,
-            best_validation=best_validation,
             selection_task=selection_task,
             best_official_score=best_official_score,
             best_task1_score=best_task1_score,

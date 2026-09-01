@@ -52,6 +52,40 @@ def sliding_window_predict(
     class_threshold: float = 0.15,
     presence_threshold: float = 0.35,
 ) -> tuple[np.ndarray, list[int], dict[str, np.ndarray]]:
+    return ensemble_sliding_window_predict(
+        [model],
+        image_zyx,
+        modality,
+        patch_size,
+        device,
+        overlap=overlap,
+        amp_dtype=amp_dtype,
+        mask_threshold=mask_threshold,
+        class_threshold=class_threshold,
+        presence_threshold=presence_threshold,
+    )
+
+
+@torch.inference_mode()
+def ensemble_sliding_window_predict(
+    models: Sequence[torch.nn.Module],
+    image_zyx: np.ndarray,
+    modality: str,
+    patch_size: Sequence[int],
+    device: torch.device,
+    overlap: float = 0.5,
+    amp_dtype: torch.dtype | None = None,
+    mask_threshold: float = 0.45,
+    class_threshold: float = 0.15,
+    presence_threshold: float = 0.35,
+    tta_left_right: bool = False,
+    location_lr_swap: Sequence[int] | None = None,
+) -> tuple[np.ndarray, list[int], dict[str, np.ndarray]]:
+    """Soft-vote fold probabilities, optionally with left-right flip TTA."""
+    if not models:
+        raise ValueError("At least one model is required")
+    if tta_left_right and location_lr_swap is None:
+        raise ValueError("location_lr_swap is required for left-right TTA")
     patch_size = tuple(int(value) for value in patch_size)
     image, crop = _pad_to_patch(image_zyx.astype(np.float32, copy=False), patch_size)
     coordinates = _coordinate_volume(image.shape)
@@ -61,12 +95,24 @@ def sliding_window_predict(
     best_class = np.zeros(image.shape, dtype=np.uint8)
     global_scores = np.zeros(52, dtype=np.float32)
     modality_value = 1.0 if modality.lower() == "mr" else -1.0
+    tta_variants = (False, True) if tta_left_right else (False,)
+    members = len(models) * len(tta_variants)
+    if location_lr_swap is not None:
+        swap = np.asarray(location_lr_swap, dtype=np.int64)
+        if swap.shape[0] < 53:
+            raise ValueError("location_lr_swap must include labels 0..52")
+        location_restore = torch.as_tensor(
+            swap[1:53] - 1, device=device, dtype=torch.long
+        )
+    else:
+        location_restore = None
 
     starts = [
         window_starts(size, patch, overlap)
         for size, patch in zip(image.shape, patch_size, strict=True)
     ]
-    model.eval()
+    for model in models:
+        model.eval()
     for z in starts[0]:
         for y in starts[1]:
             for x in starts[2]:
@@ -82,27 +128,57 @@ def sliding_window_predict(
                 )
                 inputs = np.concatenate([image_patch, modality_patch, coordinate_patch])
                 tensor = torch.from_numpy(inputs[None]).to(device)
-                with torch.autocast(
-                    device.type, dtype=amp_dtype, enabled=amp_dtype is not None
-                ):
-                    outputs = model(tensor)
-
-                binary = (
-                    torch.sigmoid(outputs["aneurysm_logits"])[0, 0]
-                    .float()
-                    .cpu()
-                    .numpy()
-                )
-                global_probability = torch.sigmoid(outputs["location_presence_logits"])[
-                    0
-                ].float()
+                binary_probability_patch = None
+                location_probability_patch = None
+                global_probability_patch = None
+                for model in models:
+                    for flipped in tta_variants:
+                        member_input = tensor
+                        if flipped:
+                            member_input = torch.flip(tensor, dims=(-1,)).clone()
+                            member_input[:, 4].mul_(-1.0)
+                        with torch.autocast(
+                            device.type,
+                            dtype=amp_dtype,
+                            enabled=amp_dtype is not None,
+                        ):
+                            outputs = model(member_input)
+                        member_binary = torch.sigmoid(
+                            outputs["aneurysm_logits"]
+                        )[0, 0].float()
+                        member_location = torch.softmax(
+                            outputs["location_logits"], dim=1
+                        )[0, 1:].float()
+                        member_global = torch.sigmoid(
+                            outputs["location_presence_logits"]
+                        )[0].float()
+                        if flipped:
+                            assert location_restore is not None
+                            member_binary = torch.flip(member_binary, dims=(-1,))
+                            member_location = torch.flip(
+                                member_location, dims=(-1,)
+                            )[location_restore]
+                            member_global = member_global[location_restore]
+                        if binary_probability_patch is None:
+                            binary_probability_patch = member_binary
+                            location_probability_patch = member_location
+                            global_probability_patch = member_global
+                        else:
+                            binary_probability_patch += member_binary
+                            location_probability_patch += member_location
+                            global_probability_patch += member_global
+                assert binary_probability_patch is not None
+                assert location_probability_patch is not None
+                assert global_probability_patch is not None
+                binary_probability_patch /= members
+                location_probability_patch /= members
+                global_probability_patch /= members
+                binary = binary_probability_patch.cpu().numpy()
+                global_probability = global_probability_patch
                 global_scores = np.maximum(
                     global_scores, global_probability.cpu().numpy()
                 )
-                location = torch.softmax(outputs["location_logits"], dim=1)[
-                    0, 1:
-                ].float()
-                location = location * (
+                location = location_probability_patch * (
                     0.5 + 0.5 * global_probability[:, None, None, None]
                 )
                 class_score, class_index = location.max(dim=0)
@@ -131,5 +207,6 @@ def sliding_window_predict(
         "binary_probability": binary_probability,
         "class_confidence": best_class_score,
         "global_location_scores": global_scores,
+        "ensemble_members": np.asarray(members, dtype=np.int64),
     }
     return segmentation, sorted(task1), diagnostics
