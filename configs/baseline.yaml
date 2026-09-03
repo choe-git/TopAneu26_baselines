@@ -50,6 +50,8 @@ validation:
   mask_threshold: 0.45
   class_threshold: 0.15
   presence_threshold: 0.35
+  presence_top_k: 3
+  presence_evidence_voxels: 64
 loss:
   aneurysm: 1.0
   location_exact: 0.25

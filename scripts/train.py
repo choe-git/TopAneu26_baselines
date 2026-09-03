@@ -341,6 +341,10 @@ def run_official_validation(
             mask_threshold=float(settings.get("mask_threshold", 0.45)),
             class_threshold=float(settings.get("class_threshold", 0.15)),
             presence_threshold=float(settings.get("presence_threshold", 0.35)),
+            presence_top_k=int(settings.get("presence_top_k", 3)),
+            presence_evidence_voxels=int(
+                settings.get("presence_evidence_voxels", 64)
+            ),
         )
         ground_truth, _ = load_zyx(
             location_mask_root / f"{case['case_id']}.nii.gz"
@@ -385,6 +389,10 @@ def run_official_validation(
             "mask": float(settings.get("mask_threshold", 0.45)),
             "class": float(settings.get("class_threshold", 0.15)),
             "presence": float(settings.get("presence_threshold", 0.35)),
+            "presence_top_k": int(settings.get("presence_top_k", 3)),
+            "presence_evidence_voxels": int(
+                settings.get("presence_evidence_voxels", 64)
+            ),
         },
     }
 

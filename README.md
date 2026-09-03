@@ -124,6 +124,9 @@ Kaggle RSNA 1st-place write-up의 핵심을 TopAneu의 52개 location과 37-clas
    예측하면서 aneurysm sphere/location segmentation을 함께 fine-tuning합니다.
 5. test에서는 5개 fold의 voxel/location/presence 확률을 soft voting하고, 원본과 left-right
    flip 결과를 평균합니다. Flip 결과는 cache의 left/right label LUT로 원래 label에 복원합니다.
+   Voxel location은 background를 제외한 52-class conditional softmax와 overlap consensus로
+   결정합니다. Task 1은 single-patch maximum 대신 aneurysm evidence로 gate한 top-k patch
+   평균을 사용해 한 noisy patch가 여러 location을 활성화하는 현상을 억제합니다.
 
 여기서 nnU-Net-style은 외부 `nnUNetv2` CLI checkpoint를 불러오는 것이 아니라, 현재 cache와
 aneurysm 모델이 encoder/decoder weight를 직접 공유할 수 있도록 repo 내부에 구현한 residual
@@ -269,6 +272,19 @@ python scripts/evaluate.py \
 `--source /new/path/to/topaneu_release`로 지정합니다. 공식 macro 결과는 `metrics.json`의
 `official_task1.macro`와 `official_task2.macro`에 저장됩니다. `diagnostics.task2_binary_voxel`은
 threshold 분석을 위한 비공식 보조 지표이며 challenge ranking에는 사용되지 않습니다.
+`per_case_metrics.json`에는 `task1_location_scores` 52개와
+`aneurysm_presence_score`도 저장되므로 prediction volume을 저장하지 않아도 Task 1 threshold를
+사후 분석할 수 있습니다.
+
+Validation 추론을 한 번 완료한 뒤 Task 1 threshold는 GPU 재추론 없이 탐색할 수 있습니다.
+
+```bash
+python scripts/tune_presence_threshold.py \
+  --per-case "$RUN_DIR/baseline/ensemble/evaluation/val/per_case_metrics.json"
+```
+
+선택 결과와 전체 sweep은 같은 폴더의 `presence_threshold_sweep.json`에 저장됩니다. Test label로
+threshold를 고르면 leakage이므로 반드시 validation 또는 OOF 결과에만 사용합니다.
 
 ## 단일 volume 추론
 
@@ -301,10 +317,12 @@ Predict CLI 전체 계약:
 | `--mask-threshold FLOAT` | 아니오 | 기본값 `0.45` |
 | `--class-threshold FLOAT` | 아니오 | 기본값 `0.15` |
 | `--presence-threshold FLOAT` | 아니오 | 기본값 `0.35` |
+| `--presence-top-k INT` | 아니오 | Task 1 class별 strongest patch 평균 개수, 기본값 `3` |
+| `--presence-evidence-voxels INT` | 아니오 | patch gate에 쓰는 strongest voxel 개수, 기본값 `64` |
 
 `--run-dir` 없이 추론할 때는 `--checkpoint`와 `--output`을 모두 지정해야 합니다.
 
-추론은 53채널 full-volume accumulator를 만들지 않고 overlap window별 최고 class confidence만
+추론은 53채널 full-volume accumulator를 만들지 않고 confidence-weighted overlap consensus만
 보존하므로 메모리 사용량이 volume 크기에 대해 작습니다. Threshold는 validation에서 조정해야 하며,
 Grand Challenge의 `.mha` socket/container adapter는 연구 baseline 성능이 확인된 뒤 붙이는 범위로
 남겨 두었습니다.

@@ -68,6 +68,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--class-threshold", type=float, default=0.15)
     parser.add_argument("--presence-threshold", type=float, default=0.35)
     parser.add_argument(
+        "--presence-top-k",
+        type=int,
+        default=3,
+        help="Average the strongest K gated patches for each Task 1 class",
+    )
+    parser.add_argument(
+        "--presence-evidence-voxels",
+        type=int,
+        default=64,
+        help="Number of strongest aneurysm voxels used for patch evidence",
+    )
+    parser.add_argument(
         "--save-predictions", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--overwrite", action="store_true")
@@ -196,19 +208,23 @@ def main() -> None:
         case_id = case["case_id"]
         case_dir = cache_root / case["cache_dir"]
         image = np.load(case_dir / "image.npy", mmap_mode="r").astype(np.float32)
-        cache_prediction, predicted_locations, _ = ensemble_sliding_window_predict(
-            models,
-            image,
-            case["modality"],
-            config["data"]["patch_size"],
-            device,
-            overlap=args.overlap,
-            amp_dtype=amp_dtype,
-            mask_threshold=args.mask_threshold,
-            class_threshold=args.class_threshold,
-            presence_threshold=args.presence_threshold,
-            tta_left_right=args.tta_left_right,
-            location_lr_swap=cache_index["location_lr_swap"],
+        cache_prediction, predicted_locations, inference_diagnostics = (
+            ensemble_sliding_window_predict(
+                models,
+                image,
+                case["modality"],
+                config["data"]["patch_size"],
+                device,
+                overlap=args.overlap,
+                amp_dtype=amp_dtype,
+                mask_threshold=args.mask_threshold,
+                class_threshold=args.class_threshold,
+                presence_threshold=args.presence_threshold,
+                presence_top_k=args.presence_top_k,
+                presence_evidence_voxels=args.presence_evidence_voxels,
+                tta_left_right=args.tta_left_right,
+                location_lr_swap=cache_index["location_lr_swap"],
+            )
         )
 
         ground_truth, ground_truth_metadata = load_zyx(
@@ -246,6 +262,13 @@ def main() -> None:
                 "original_spacing_xyz": ground_truth_metadata["spacing_xyz"],
                 "task1_truth": [int(value) for value in case["json_locations"]],
                 "task1_prediction": [int(value) for value in predicted_locations],
+                "task1_location_scores": [
+                    float(value)
+                    for value in inference_diagnostics["global_location_scores"]
+                ],
+                "aneurysm_presence_score": float(
+                    inference_diagnostics["global_aneurysm_score"]
+                ),
                 "task2_binary_diagnostic": binary_metrics(tp, fp, fn, tn),
             }
         )
@@ -285,12 +308,17 @@ def main() -> None:
             "mask": args.mask_threshold,
             "class": args.class_threshold,
             "presence": args.presence_threshold,
+            "presence_top_k": args.presence_top_k,
+            "presence_evidence_voxels": args.presence_evidence_voxels,
         },
         "inference": {
             "soft_voting_folds": args.ensemble_folds,
             "models": len(models),
             "left_right_tta": args.tta_left_right,
             "probability_members": len(models) * (2 if args.tta_left_right else 1),
+            "location_probability": "conditional softmax over classes 1..52",
+            "location_overlap": "confidence-weighted consensus",
+            "task1_aggregation": "aneurysm-gated top-k patch mean",
         },
         "official_task1": summarize_task1(task1_counts_per_case),
         "official_task2": summarize_task2(
