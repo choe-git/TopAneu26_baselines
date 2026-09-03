@@ -6,6 +6,8 @@ from collections.abc import Sequence
 
 import numpy as np
 import torch
+from scipy.ndimage import find_objects
+from scipy.ndimage import label as connected_components
 
 
 def window_starts(length: int, patch: int, overlap: float) -> list[int]:
@@ -39,6 +41,74 @@ def _coordinate_volume(shape: tuple[int, int, int]) -> np.ndarray:
     return np.stack(np.meshgrid(*axes, indexing="ij"))
 
 
+def _component_postprocess(
+    binary_probability: np.ndarray,
+    voxel_class: np.ndarray,
+    class_confidence: np.ndarray,
+    mask_threshold: float,
+    presence_threshold: float,
+    minimum_component_voxels: int,
+    maximum_components: int,
+) -> tuple[np.ndarray, list[int], np.ndarray]:
+    """Keep strong binary candidates and assign one location per component."""
+    candidate_mask = binary_probability >= mask_threshold
+    component_map, count = connected_components(
+        candidate_mask, structure=np.ones((3, 3, 3), dtype=np.uint8)
+    )
+    candidates = []
+    for component_id, region in enumerate(find_objects(component_map), start=1):
+        if region is None:
+            continue
+        local_component_map = component_map[region]
+        component = local_component_map == component_id
+        voxels = int(np.count_nonzero(component))
+        if voxels < minimum_component_voxels:
+            continue
+        binary_values = binary_probability[region][component]
+        detection_score = float(
+            0.7 * binary_values.max() + 0.3 * binary_values.mean()
+        )
+        vote_weights = binary_values * np.maximum(
+            class_confidence[region][component], 1e-3
+        )
+        class_votes = np.bincount(
+            voxel_class[region][component], weights=vote_weights, minlength=53
+        )
+        class_id = int(np.argmax(class_votes[1:]) + 1)
+        location_confidence = float(
+            class_votes[class_id] / max(class_votes[1:].sum(), 1e-8)
+        )
+        candidates.append(
+            (
+                detection_score,
+                location_confidence,
+                voxels,
+                component_id,
+                region,
+                class_id,
+            )
+        )
+
+    candidates.sort(key=lambda item: (item[0], item[2]), reverse=True)
+    selected = candidates[:maximum_components]
+    segmentation = np.zeros(binary_probability.shape, dtype=np.uint8)
+    location_scores = np.zeros(52, dtype=np.float32)
+    for detection_score, _, _, component_id, region, class_id in selected:
+        local_segmentation = segmentation[region]
+        local_segmentation[component_map[region] == component_id] = class_id
+        location_scores[class_id - 1] = max(
+            location_scores[class_id - 1], detection_score
+        )
+    locations = sorted(
+        {
+            int(class_id)
+            for detection_score, _, _, _, _, class_id in selected
+            if detection_score >= presence_threshold
+        }
+    )
+    return segmentation, locations, location_scores
+
+
 @torch.inference_mode()
 def sliding_window_predict(
     model: torch.nn.Module,
@@ -53,6 +123,8 @@ def sliding_window_predict(
     presence_threshold: float = 0.35,
     presence_top_k: int = 3,
     presence_evidence_voxels: int = 64,
+    minimum_component_voxels: int = 5,
+    maximum_components: int = 5,
 ) -> tuple[np.ndarray, list[int], dict[str, np.ndarray]]:
     return ensemble_sliding_window_predict(
         [model],
@@ -67,6 +139,8 @@ def sliding_window_predict(
         presence_threshold=presence_threshold,
         presence_top_k=presence_top_k,
         presence_evidence_voxels=presence_evidence_voxels,
+        minimum_component_voxels=minimum_component_voxels,
+        maximum_components=maximum_components,
     )
 
 
@@ -84,6 +158,8 @@ def ensemble_sliding_window_predict(
     presence_threshold: float = 0.35,
     presence_top_k: int = 3,
     presence_evidence_voxels: int = 64,
+    minimum_component_voxels: int = 5,
+    maximum_components: int = 5,
     tta_left_right: bool = False,
     location_lr_swap: Sequence[int] | None = None,
 ) -> tuple[np.ndarray, list[int], dict[str, np.ndarray]]:
@@ -100,6 +176,10 @@ def ensemble_sliding_window_predict(
     if presence_top_k <= 0 or presence_evidence_voxels <= 0:
         raise ValueError(
             "presence_top_k and presence_evidence_voxels must be positive"
+        )
+    if minimum_component_voxels <= 0 or maximum_components <= 0:
+        raise ValueError(
+            "minimum_component_voxels and maximum_components must be positive"
         )
     patch_size = tuple(int(value) for value in patch_size)
     image, crop = _pad_to_patch(image_zyx.astype(np.float32, copy=False), patch_size)
@@ -242,22 +322,29 @@ def ensemble_sliding_window_predict(
     global_aneurysm_score = float(
         np.mean(sorted(aneurysm_patch_scores)[-top_k:])
     )
-    segmentation = best_class.copy()
-    segmentation[
-        (binary_probability < mask_threshold) | (class_confidence < class_threshold)
-    ] = 0
-    segmentation = segmentation[crop]
     binary_probability = binary_probability[crop]
     class_confidence = class_confidence[crop]
-    task1 = {
-        int(value) for value in np.flatnonzero(global_scores >= presence_threshold) + 1
-    }
+    best_class = best_class[crop]
+    segmentation, task1, component_location_scores = _component_postprocess(
+        binary_probability,
+        best_class,
+        class_confidence,
+        mask_threshold,
+        presence_threshold,
+        minimum_component_voxels,
+        maximum_components,
+    )
     diagnostics = {
         "binary_probability": binary_probability,
         "class_confidence": class_confidence,
-        "global_location_scores": global_scores,
+        "global_location_scores": component_location_scores,
+        "patch_location_scores": global_scores,
         "global_aneurysm_score": np.asarray(global_aneurysm_score, dtype=np.float32),
         "presence_top_k": np.asarray(top_k, dtype=np.int64),
         "ensemble_members": np.asarray(members, dtype=np.int64),
+        "minimum_component_voxels": np.asarray(
+            minimum_component_voxels, dtype=np.int64
+        ),
+        "maximum_components": np.asarray(maximum_components, dtype=np.int64),
     }
-    return segmentation, sorted(task1), diagnostics
+    return segmentation, task1, diagnostics

@@ -20,6 +20,7 @@ model:
   location_classes: 52
   location_transformer_layers: 2
   location_transformer_heads: 4
+  dual_decoder: true
 vessel_pretrain:
   epochs: 1000
   train_samples: 1200
@@ -52,13 +53,17 @@ validation:
   presence_threshold: 0.35
   presence_top_k: 3
   presence_evidence_voxels: 64
+  minimum_component_voxels: 5
+  maximum_components: 5
 loss:
   aneurysm: 1.0
-  location_exact: 0.25
-  location_territory: 0.15
-  location_side: 0.10
+  aneurysm_positive_weight: 10.0
+  location_exact: 0.50
+  location_territory: 0.0
+  location_side: 0.0
   vessel: 0.1
-  location_presence_exact: 0.05
-  location_presence_territory: 0.03
-  location_presence_side: 0.02
-  aneurysm_presence: 0.05
+  location_presence_exact: 0.30
+  location_presence_positive_weight: 4.0
+  location_presence_territory: 0.0
+  location_presence_side: 0.0
+  aneurysm_presence: 0.10

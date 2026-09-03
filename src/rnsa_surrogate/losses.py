@@ -111,6 +111,33 @@ def _balanced_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch
     return F.cross_entropy(logits, target, weight=class_weights)
 
 
+def _foreground_location_cross_entropy(
+    logits: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    """Classify location only where an aneurysm exists.
+
+    Background is handled by the independent binary decoder. This prevents the
+    52 rare location classes from competing with hundreds of thousands of
+    background voxels in the same softmax.
+    """
+    foreground = target > 0
+    if not torch.any(foreground):
+        return logits.sum() * 0.0
+    foreground_logits = logits[:, 1:53].movedim(1, -1)[foreground]
+    foreground_target = target[foreground] - 1
+    return F.cross_entropy(foreground_logits, foreground_target)
+
+
+def _positive_weighted_bce(
+    logits: torch.Tensor, target: torch.Tensor, positive_weight: float = 10.0
+) -> torch.Tensor:
+    return F.binary_cross_entropy_with_logits(
+        logits,
+        target,
+        pos_weight=logits.new_tensor(positive_weight),
+    )
+
+
 def _group_presence(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -221,43 +248,78 @@ def multitask_loss(
     weights = weights or {}
     binary_target = (batch["location"] > 0).float()[:, None]
     binary = focal_tversky_loss(outputs["aneurysm_logits"], binary_target)
-    binary += F.binary_cross_entropy_with_logits(
-        outputs["aneurysm_logits"], binary_target
+    binary += soft_dice_loss(outputs["aneurysm_logits"], binary_target)
+    binary += _positive_weighted_bce(
+        outputs["aneurysm_logits"],
+        binary_target,
+        positive_weight=float(weights.get("aneurysm_positive_weight", 10.0)),
     )
 
     flat_location = batch["location"].long()
-    exact_location = _balanced_cross_entropy(outputs["location_logits"], flat_location)
-    territory_target = _group_voxel_target(flat_location, TERRITORY_LOOKUP)
-    side_target = _group_voxel_target(flat_location, SIDE_LOOKUP)
-    territory_location = _balanced_cross_entropy(
-        _aggregate_class_logits(outputs["location_logits"], TERRITORY_GROUPS),
-        territory_target,
+    exact_location = _foreground_location_cross_entropy(
+        outputs["location_logits"], flat_location
     )
-    side_location = _balanced_cross_entropy(
-        _aggregate_class_logits(outputs["location_logits"], SIDE_GROUPS), side_target
+    location_territory_weight = _hierarchy_weight(
+        weights, "location_territory", 0.15, "location_seg", 0.30
     )
+    location_side_weight = _hierarchy_weight(
+        weights, "location_side", 0.10, "location_seg", 0.20
+    )
+    zero = outputs["location_logits"].sum() * 0.0
+    territory_location = zero
+    if location_territory_weight > 0:
+        territory_location = _balanced_cross_entropy(
+            _aggregate_class_logits(outputs["location_logits"], TERRITORY_GROUPS),
+            _group_voxel_target(flat_location, TERRITORY_LOOKUP),
+        )
+    side_location = zero
+    if location_side_weight > 0:
+        side_location = _balanced_cross_entropy(
+            _aggregate_class_logits(outputs["location_logits"], SIDE_GROUPS),
+            _group_voxel_target(flat_location, SIDE_LOOKUP),
+        )
     vessel = vessel_loss(
         outputs["vessel_logits"], batch["vessel"], batch.get("vessel_valid")
     )
-    exact_location_presence = asymmetric_multilabel_loss(
-        outputs["location_presence_logits"], batch["location_presence"]
-    )
-    territory_presence_logits, territory_presence_target = _group_presence(
+    exact_location_presence = _positive_weighted_bce(
         outputs["location_presence_logits"],
-        batch["location_presence"],
-        TERRITORY_GROUPS[1:],
+        batch["location_presence"].to(outputs["location_presence_logits"].dtype),
+        positive_weight=float(weights.get("location_presence_positive_weight", 4.0)),
     )
-    side_presence_logits, side_presence_target = _group_presence(
-        outputs["location_presence_logits"],
-        batch["location_presence"],
-        SIDE_GROUPS[1:],
+    presence_territory_weight = _hierarchy_weight(
+        weights,
+        "location_presence_territory",
+        0.03,
+        "location_presence",
+        0.30,
     )
-    territory_location_presence = asymmetric_multilabel_loss(
-        territory_presence_logits, territory_presence_target
+    presence_side_weight = _hierarchy_weight(
+        weights,
+        "location_presence_side",
+        0.02,
+        "location_presence",
+        0.20,
     )
-    side_location_presence = asymmetric_multilabel_loss(
-        side_presence_logits, side_presence_target
-    )
+    territory_location_presence = zero
+    if presence_territory_weight > 0:
+        territory_presence_logits, territory_presence_target = _group_presence(
+            outputs["location_presence_logits"],
+            batch["location_presence"],
+            TERRITORY_GROUPS[1:],
+        )
+        territory_location_presence = asymmetric_multilabel_loss(
+            territory_presence_logits, territory_presence_target
+        )
+    side_location_presence = zero
+    if presence_side_weight > 0:
+        side_presence_logits, side_presence_target = _group_presence(
+            outputs["location_presence_logits"],
+            batch["location_presence"],
+            SIDE_GROUPS[1:],
+        )
+        side_location_presence = asymmetric_multilabel_loss(
+            side_presence_logits, side_presence_target
+        )
     presence = F.binary_cross_entropy_with_logits(
         outputs["aneurysm_presence_logits"].flatten(),
         batch["aneurysm_presence"].float(),
@@ -267,10 +329,8 @@ def multitask_loss(
         weights.get("aneurysm", 1.0) * binary
         + _hierarchy_weight(weights, "location_exact", 0.25, "location_seg", 0.50)
         * exact_location
-        + _hierarchy_weight(weights, "location_territory", 0.15, "location_seg", 0.30)
-        * territory_location
-        + _hierarchy_weight(weights, "location_side", 0.10, "location_seg", 0.20)
-        * side_location
+        + location_territory_weight * territory_location
+        + location_side_weight * side_location
         + weights.get("vessel", 0.1) * vessel
         + _hierarchy_weight(
             weights,
@@ -280,22 +340,8 @@ def multitask_loss(
             0.50,
         )
         * exact_location_presence
-        + _hierarchy_weight(
-            weights,
-            "location_presence_territory",
-            0.03,
-            "location_presence",
-            0.30,
-        )
-        * territory_location_presence
-        + _hierarchy_weight(
-            weights,
-            "location_presence_side",
-            0.02,
-            "location_presence",
-            0.20,
-        )
-        * side_location_presence
+        + presence_territory_weight * territory_location_presence
+        + presence_side_weight * side_location_presence
         + weights.get("aneurysm_presence", 0.05) * presence
     )
     values: dict[str, Any] = {

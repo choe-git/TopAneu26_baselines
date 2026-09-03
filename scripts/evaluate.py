@@ -79,6 +79,8 @@ def parse_args() -> argparse.Namespace:
         default=64,
         help="Number of strongest aneurysm voxels used for patch evidence",
     )
+    parser.add_argument("--minimum-component-voxels", type=int, default=5)
+    parser.add_argument("--maximum-components", type=int, default=5)
     parser.add_argument(
         "--save-predictions", action=argparse.BooleanOptionalAction, default=True
     )
@@ -222,6 +224,8 @@ def main() -> None:
                 presence_threshold=args.presence_threshold,
                 presence_top_k=args.presence_top_k,
                 presence_evidence_voxels=args.presence_evidence_voxels,
+                minimum_component_voxels=args.minimum_component_voxels,
+                maximum_components=args.maximum_components,
                 tta_left_right=args.tta_left_right,
                 location_lr_swap=cache_index["location_lr_swap"],
             )
@@ -310,6 +314,8 @@ def main() -> None:
             "presence": args.presence_threshold,
             "presence_top_k": args.presence_top_k,
             "presence_evidence_voxels": args.presence_evidence_voxels,
+            "minimum_component_voxels": args.minimum_component_voxels,
+            "maximum_components": args.maximum_components,
         },
         "inference": {
             "soft_voting_folds": args.ensemble_folds,
@@ -317,8 +323,8 @@ def main() -> None:
             "left_right_tta": args.tta_left_right,
             "probability_members": len(models) * (2 if args.tta_left_right else 1),
             "location_probability": "conditional softmax over classes 1..52",
-            "location_overlap": "confidence-weighted consensus",
-            "task1_aggregation": "aneurysm-gated top-k patch mean",
+            "location_overlap": "component-level weighted vote",
+            "task1_aggregation": "retained aneurysm component labels",
         },
         "official_task1": summarize_task1(task1_counts_per_case),
         "official_task2": summarize_task2(

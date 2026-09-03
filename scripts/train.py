@@ -345,6 +345,10 @@ def run_official_validation(
             presence_evidence_voxels=int(
                 settings.get("presence_evidence_voxels", 64)
             ),
+            minimum_component_voxels=int(
+                settings.get("minimum_component_voxels", 5)
+            ),
+            maximum_components=int(settings.get("maximum_components", 5)),
         )
         ground_truth, _ = load_zyx(
             location_mask_root / f"{case['case_id']}.nii.gz"
@@ -393,6 +397,10 @@ def run_official_validation(
             "presence_evidence_voxels": int(
                 settings.get("presence_evidence_voxels", 64)
             ),
+            "minimum_component_voxels": int(
+                settings.get("minimum_component_voxels", 5)
+            ),
+            "maximum_components": int(settings.get("maximum_components", 5)),
         },
     }
 

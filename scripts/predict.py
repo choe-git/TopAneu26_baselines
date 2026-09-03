@@ -34,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--presence-threshold", type=float, default=0.35)
     parser.add_argument("--presence-top-k", type=int, default=3)
     parser.add_argument("--presence-evidence-voxels", type=int, default=64)
+    parser.add_argument("--minimum-component-voxels", type=int, default=5)
+    parser.add_argument("--maximum-components", type=int, default=5)
     return parser.parse_args()
 
 
@@ -94,6 +96,8 @@ def main() -> None:
         presence_threshold=args.presence_threshold,
         presence_top_k=args.presence_top_k,
         presence_evidence_voxels=args.presence_evidence_voxels,
+        minimum_component_voxels=args.minimum_component_voxels,
+        maximum_components=args.maximum_components,
     )
 
     task2_dir = output_dir / "task2_masks"

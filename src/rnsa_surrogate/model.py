@@ -121,13 +121,18 @@ class RNSASurrogate(nn.Module):
         location_classes: int = 52,
         location_transformer_layers: int = 0,
         location_transformer_heads: int = 4,
+        dual_decoder: bool = False,
     ) -> None:
         super().__init__()
         if levels < 3:
             raise ValueError("levels must be at least 3")
         channels = [base_channels * 2**index for index in range(levels)]
         self.encoder = Encoder(in_channels, channels)
+        # Keep vessel anatomy and sparse aneurysm decoding on separate paths.
+        # Sharing a decoder forces tiny aneurysm gradients to compete directly
+        # with the much larger vessel structures.
         self.decoder = Decoder(channels)
+        self.aneurysm_decoder = Decoder(channels) if dual_decoder else None
         self.aneurysm_head = nn.Conv3d(channels[0], 1, 1)
         self.location_head = nn.Conv3d(channels[0], location_classes + 1, 1)
         self.vessel_head = nn.Conv3d(channels[1], vessel_classes, 1)
@@ -172,7 +177,12 @@ class RNSASurrogate(nn.Module):
     def forward(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
         encoded = self.encoder(inputs)
         decoded = self.decoder(encoded)
-        full = decoded[0]
+        aneurysm_decoded = (
+            self.aneurysm_decoder(encoded)
+            if self.aneurysm_decoder is not None
+            else decoded
+        )
+        full = aneurysm_decoded[0]
         half = decoded[1]
         aneurysm_logits = self.aneurysm_head(full)
         location_logits = self.location_head(full)
@@ -257,6 +267,15 @@ def load_vessel_pretraining(
     }
     if not transferred:
         raise ValueError("Vessel checkpoint has no compatible encoder/decoder weights")
+    # Initialize the new aneurysm decoder from the same vessel-aware features.
+    aneurysm_transfer = {}
+    for name, value in state.items():
+        if not name.startswith("decoder."):
+            continue
+        target_name = "aneurysm_decoder." + name.removeprefix("decoder.")
+        if target_name in target and target[target_name].shape == value.shape:
+            aneurysm_transfer[target_name] = value
+    transferred.update(aneurysm_transfer)
     target.update(transferred)
     model.load_state_dict(target)
     return {

@@ -128,6 +128,16 @@ Kaggle RSNA 1st-place write-up의 핵심을 TopAneu의 52개 location과 37-clas
    결정합니다. Task 1은 single-patch maximum 대신 aneurysm evidence로 gate한 top-k patch
    평균을 사용해 한 noisy patch가 여러 location을 활성화하는 현상을 억제합니다.
 
+현재 radical baseline은 shared encoder 뒤에 vessel decoder와 aneurysm decoder를 분리합니다.
+Binary aneurysm loss는 Focal-Tversky + Dice + positive-weighted BCE를 사용하고, 52-class
+location CE는 background를 제외한 실제 aneurysm voxel에서만 계산합니다. 추론에서는 binary
+mask를 location confidence로 제거하지 않습니다. 먼저 3D connected component를 만든 뒤 component
+내부 confidence-weighted vote로 위치 하나를 배정하며, scan당 confidence 상위 5개 component만
+유지합니다. Task 1 label도 이 component에서 생성합니다.
+
+`model.dual_decoder: true`는 checkpoint 구조를 변경하므로 이 설정으로는 새 RUN_DIR에서 다시
+학습해야 합니다. 과거 checkpoint는 과거 config에 해당 항목이 없으므로 계속 읽을 수 있습니다.
+
 여기서 nnU-Net-style은 외부 `nnUNetv2` CLI checkpoint를 불러오는 것이 아니라, 현재 cache와
 aneurysm 모델이 encoder/decoder weight를 직접 공유할 수 있도록 repo 내부에 구현한 residual
 3D U-Net pretraining stage를 의미합니다. Vessel pretraining 자체는 fold를 나누지 않으며,
@@ -315,10 +325,12 @@ Predict CLI 전체 계약:
 | `--device DEVICE` | 아니오 | 기본값 `cuda` |
 | `--overlap FLOAT` | 아니오 | 기본값 `0.5` |
 | `--mask-threshold FLOAT` | 아니오 | 기본값 `0.45` |
-| `--class-threshold FLOAT` | 아니오 | 기본값 `0.15` |
-| `--presence-threshold FLOAT` | 아니오 | 기본값 `0.35` |
+| `--class-threshold FLOAT` | 아니오 | 이전 checkpoint 호환 인자 |
+| `--presence-threshold FLOAT` | 아니오 | Task 1 component score 기준, 기본값 `0.35` |
 | `--presence-top-k INT` | 아니오 | Task 1 class별 strongest patch 평균 개수, 기본값 `3` |
 | `--presence-evidence-voxels INT` | 아니오 | patch gate에 쓰는 strongest voxel 개수, 기본값 `64` |
+| `--minimum-component-voxels INT` | 아니오 | 제거할 최소 component 크기, 기본값 `5` |
+| `--maximum-components INT` | 아니오 | scan당 유지할 최대 후보 수, 기본값 `5` |
 
 `--run-dir` 없이 추론할 때는 `--checkpoint`와 `--output`을 모두 지정해야 합니다.
 
