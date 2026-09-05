@@ -60,6 +60,8 @@ refiner_location:
   amp: bf16
   objectness_weight: 1.0
   location_weight: 1.0
+  location_class_balance: none
+  stage1_class_dropout: 0.0
   fixed_threshold: 0.50
 train:
   epochs: 150

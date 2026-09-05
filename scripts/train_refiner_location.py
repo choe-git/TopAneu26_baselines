@@ -47,6 +47,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("cuda", "cpu", "auto"), default="cuda")
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--epochs", type=int, help="Override refiner_location.epochs")
+    parser.add_argument(
+        "--location-class-balance",
+        choices=("none", "sqrt_inverse"),
+        help="Override refiner_location.location_class_balance",
+    )
+    parser.add_argument(
+        "--stage1-class-dropout",
+        type=float,
+        help="Probability of hiding the stage-1 class during training",
+    )
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args()
 
@@ -86,6 +96,8 @@ def run_epoch(
     threshold: float,
     objectness_weight: float,
     location_weight: float,
+    location_class_weights: torch.Tensor | None,
+    stage1_class_dropout: float,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> dict[str, Any]:
     training = optimizer is not None
@@ -105,6 +117,11 @@ def run_epoch(
             image = batch["image"].to(device, non_blocking=True)
             metadata = batch["metadata"].to(device, non_blocking=True)
             stage1_class = batch["stage1_class"].to(device, non_blocking=True)
+            if training and stage1_class_dropout > 0:
+                hidden = torch.rand(
+                    stage1_class.shape, device=device
+                ) < stage1_class_dropout
+                stage1_class = stage1_class.masked_fill(hidden, 0)
             target = batch["target"].to(device, non_blocking=True)
             target_class = batch["target_class"].to(device, non_blocking=True)
             with torch.autocast(
@@ -116,7 +133,11 @@ def run_epoch(
                 )
                 positive = target_class > 0
                 location_loss = (
-                    F.cross_entropy(outputs["location_logits"][positive], target_class[positive])
+                    F.cross_entropy(
+                        outputs["location_logits"][positive],
+                        target_class[positive],
+                        weight=location_class_weights,
+                    )
                     if torch.any(positive)
                     else outputs["location_logits"].sum() * 0.0
                 )
@@ -172,6 +193,12 @@ def main() -> None:
         if args.epochs < 1:
             raise ValueError("--epochs must be positive")
         settings["epochs"] = int(args.epochs)
+    if args.location_class_balance is not None:
+        settings["location_class_balance"] = args.location_class_balance
+    if args.stage1_class_dropout is not None:
+        if not 0.0 <= args.stage1_class_dropout < 1.0:
+            raise ValueError("--stage1-class-dropout must be in [0, 1)")
+        settings["stage1_class_dropout"] = float(args.stage1_class_dropout)
     if args.smoke_test:
         settings.update(epochs=1, train_samples=4, num_workers=0)
     config["refiner_location"] = settings
@@ -248,6 +275,28 @@ def main() -> None:
     threshold = float(settings.get("fixed_threshold", 0.5))
     objectness_weight = float(settings.get("objectness_weight", 1.0))
     location_weight = float(settings.get("location_weight", 1.0))
+    class_balance = str(settings.get("location_class_balance", "none"))
+    if class_balance not in {"none", "sqrt_inverse"}:
+        raise ValueError("location_class_balance must be none or sqrt_inverse")
+    location_class_weights = None
+    if class_balance == "sqrt_inverse":
+        counts = np.bincount(
+            [
+                int(record["target_class"])
+                for record in train_records
+                if int(record["target_class"]) > 0
+            ],
+            minlength=53,
+        ).astype(np.float32)
+        positive_counts = counts[1:][counts[1:] > 0]
+        reference = float(np.median(positive_counts)) if positive_counts.size else 1.0
+        weights = np.ones(53, dtype=np.float32)
+        present = counts > 0
+        weights[present] = np.sqrt(reference / counts[present])
+        weights[0] = 1.0
+        weights = np.clip(weights, 0.5, 4.0)
+        location_class_weights = torch.from_numpy(weights).to(device)
+    stage1_class_dropout = float(settings.get("stage1_class_dropout", 0.0))
     amp_dtype = (
         torch.bfloat16
         if device.type == "cuda" and str(settings.get("amp", "bf16")) == "bf16"
@@ -344,11 +393,12 @@ def main() -> None:
             sampler.set_epoch(epoch - 1)
             train_result = run_epoch(
                 model, train_loader, device, amp_dtype, threshold,
-                objectness_weight, location_weight, optimizer
+                objectness_weight, location_weight, location_class_weights,
+                stage1_class_dropout, optimizer
             )
             val_result = run_epoch(
                 model, val_loader, device, amp_dtype, threshold,
-                objectness_weight, location_weight
+                objectness_weight, location_weight, location_class_weights, 0.0
             )
             improved = val_result["loss"] < best_validation_loss
             best_validation_loss = min(
