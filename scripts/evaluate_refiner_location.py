@@ -53,6 +53,12 @@ def parse_args() -> argparse.Namespace:
         default=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
     )
     parser.add_argument("--selection-task", choices=("task1", "task2"), default="task2")
+    parser.add_argument(
+        "--relabel-confidence-threshold",
+        type=float,
+        default=0.0,
+        help="Keep the stage-1 class below this refiner confidence",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
@@ -115,6 +121,7 @@ def evaluate_threshold(
     source_root: Path,
     ground_truth_cache: dict[str, np.ndarray],
     full_segmentation_metrics: bool = True,
+    relabel_confidence_threshold: float = 0.0,
     save_root: Path | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     task1_counts_list = []
@@ -132,7 +139,12 @@ def evaluate_threshold(
         for record in records_by_case.get(case_id, []):
             prediction = predictions[str(record["candidate_id"])]
             keep = float(prediction["objectness"]) >= threshold
-            refined_class = int(prediction["location_class"])
+            location_confidence = float(prediction["location_confidence"])
+            refined_class = (
+                int(prediction["location_class"])
+                if location_confidence >= relabel_confidence_threshold
+                else int(record["stage1_class"])
+            )
             candidate_details.append(
                 {
                     "candidate_id": record["candidate_id"],
@@ -228,6 +240,8 @@ def main() -> None:
     args = parse_args()
     if not args.thresholds or any(not 0.0 <= value <= 1.0 for value in args.thresholds):
         raise ValueError("Thresholds must be in [0, 1]")
+    if not 0.0 <= args.relabel_confidence_threshold <= 1.1:
+        raise ValueError("relabel-confidence-threshold must be in [0, 1.1]")
     layout = BaselineRunLayout.from_root(args.run_dir)
     output = (
         args.output
@@ -326,6 +340,7 @@ def main() -> None:
             source_root,
             ground_truth_cache,
             False,
+            args.relabel_confidence_threshold,
         )
         sweep.append(metrics)
     best = max(
@@ -346,6 +361,7 @@ def main() -> None:
         source_root,
         ground_truth_cache,
         True,
+        args.relabel_confidence_threshold,
         output if args.save_predictions else None,
     )
     output.mkdir(parents=True, exist_ok=True)
@@ -374,6 +390,7 @@ def main() -> None:
             "note": "one threshold selected from combined held-out-fold predictions",
         },
         "location_policy": "retain stage1 component mask; relabel with refiner argmax",
+        "relabel_confidence_threshold": args.relabel_confidence_threshold,
         "organizer_vessel_input": False,
         "checkpoints": checkpoint_paths,
         "checkpoint_sha256s": checkpoint_hashes,
