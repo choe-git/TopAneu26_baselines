@@ -35,6 +35,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--folds", type=int, nargs="+")
     parser.add_argument("--device", choices=("cuda", "cpu", "auto"), default="cuda")
     parser.add_argument("--tta-left-right", action="store_true")
+    parser.add_argument("--mask-threshold", type=float)
+    parser.add_argument("--presence-threshold", type=float)
+    parser.add_argument("--minimum-component-voxels", type=int)
+    parser.add_argument("--maximum-components", type=int)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -122,6 +126,28 @@ def main() -> None:
             ),
             "tta_left_right": bool(args.tta_left_right),
         }
+        if args.mask_threshold is not None:
+            inference_settings["mask_threshold"] = float(args.mask_threshold)
+        if args.presence_threshold is not None:
+            inference_settings["presence_threshold"] = float(
+                args.presence_threshold
+            )
+        if args.minimum_component_voxels is not None:
+            inference_settings["minimum_component_voxels"] = int(
+                args.minimum_component_voxels
+            )
+        if args.maximum_components is not None:
+            inference_settings["maximum_components"] = int(
+                args.maximum_components
+            )
+        if not 0.0 < inference_settings["mask_threshold"] < 1.0:
+            raise ValueError("mask_threshold must be between zero and one")
+        if not 0.0 < inference_settings["presence_threshold"] < 1.0:
+            raise ValueError("presence_threshold must be between zero and one")
+        if inference_settings["minimum_component_voxels"] < 1:
+            raise ValueError("minimum_component_voxels must be positive")
+        if inference_settings["maximum_components"] < 1:
+            raise ValueError("maximum_components must be positive")
         amp_name = str(config["train"].get("amp", "none"))
         amp_dtype = {
             "bf16": torch.bfloat16,
