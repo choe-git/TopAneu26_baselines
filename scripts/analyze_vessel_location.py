@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from scipy.ndimage import distance_transform_edt
 from tqdm import tqdm
 
@@ -93,6 +94,79 @@ def weighted_knn(
     return np.asarray(predictions, dtype=np.int64)
 
 
+def mlp_predict(
+    train_features: np.ndarray,
+    train_labels: np.ndarray,
+    validation_features: np.ndarray,
+    hidden: int,
+    geometry_weight: float,
+    class_weight_power: float,
+) -> np.ndarray:
+    mean = train_features.mean(axis=0)
+    scale = train_features.std(axis=0)
+    scale[scale < 1e-5] = 1.0
+    train = (train_features - mean) / scale
+    validation = (validation_features - mean) / scale
+    train[:, -7:] *= geometry_weight
+    validation[:, -7:] *= geometry_weight
+    torch.manual_seed(2026)
+    torch.set_num_threads(2)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(train.shape[1], hidden),
+        torch.nn.LayerNorm(hidden),
+        torch.nn.SiLU(),
+        torch.nn.Dropout(0.10),
+        torch.nn.Linear(hidden, 52),
+    )
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=3e-3, weight_decay=1e-3
+    )
+    inputs = torch.from_numpy(train).float()
+    targets = torch.from_numpy(train_labels - 1).long()
+    counts = torch.bincount(targets, minlength=52).float()
+    weights = counts.clamp_min(1.0).pow(-class_weight_power)
+    weights[counts == 0] = 0.0
+    model.train()
+    for _ in range(400):
+        optimizer.zero_grad(set_to_none=True)
+        loss = torch.nn.functional.cross_entropy(
+            model(inputs), targets, weight=weights
+        )
+        loss.backward()
+        optimizer.step()
+    model.eval()
+    with torch.inference_mode():
+        prediction = model(torch.from_numpy(validation).float()).argmax(dim=1) + 1
+    return prediction.numpy()
+
+
+def evaluate_predictions(
+    prediction: np.ndarray,
+    validation_labels: np.ndarray,
+    validation_case_ids: np.ndarray,
+    validation_ids: set[str],
+    truth_by_case: dict[str, list[int]],
+) -> dict[str, Any]:
+    predictions_by_case: dict[str, list[int]] = defaultdict(list)
+    for case_id, class_id in zip(validation_case_ids, prediction, strict=True):
+        predictions_by_case[str(case_id)].append(int(class_id))
+    counts = [
+        task1_case_counts(
+            truth_by_case[case_id], predictions_by_case.get(case_id, [])
+        )
+        for case_id in sorted(validation_ids)
+    ]
+    summary = summarize_task1(counts)
+    macro = summary["macro"]
+    return {
+        "instance_accuracy": float(np.mean(prediction == validation_labels)),
+        "selection_score": float(
+            np.mean([macro["precision"], macro["recall"], macro["mcc"]])
+        ),
+        "official_task1": summary,
+    }
+
+
 def main() -> None:
     args = parse_args()
     layout = BaselineRunLayout.from_root(args.run_dir)
@@ -143,34 +217,49 @@ def main() -> None:
                 neighbors,
                 geometry_weight,
             )
-            predictions_by_case: dict[str, list[int]] = defaultdict(list)
-            for case_id, class_id in zip(
-                case_array[validation_mask], prediction, strict=True
-            ):
-                predictions_by_case[str(case_id)].append(int(class_id))
-            counts = [
-                task1_case_counts(
-                    truth_by_case[case_id], predictions_by_case.get(case_id, [])
-                )
-                for case_id in sorted(validation_ids)
-            ]
-            summary = summarize_task1(counts)
-            macro = summary["macro"]
-            results.append(
+            result = evaluate_predictions(
+                prediction,
+                label_array[validation_mask],
+                case_array[validation_mask],
+                validation_ids,
+                truth_by_case,
+            )
+            result.update(
                 {
+                    "method": "weighted_knn",
                     "neighbors": neighbors,
                     "geometry_weight": geometry_weight,
-                    "instance_accuracy": float(
-                        np.mean(prediction == label_array[validation_mask])
-                    ),
-                    "selection_score": float(
-                        np.mean(
-                            [macro["precision"], macro["recall"], macro["mcc"]]
-                        )
-                    ),
-                    "official_task1": summary,
                 }
             )
+            results.append(result)
+
+    for hidden in (64, 128):
+        for geometry_weight in (0.5, 1.0, 2.0):
+            for class_weight_power in (0.0, 0.5):
+                prediction = mlp_predict(
+                    feature_array[train_mask],
+                    label_array[train_mask],
+                    feature_array[validation_mask],
+                    hidden,
+                    geometry_weight,
+                    class_weight_power,
+                )
+                result = evaluate_predictions(
+                    prediction,
+                    label_array[validation_mask],
+                    case_array[validation_mask],
+                    validation_ids,
+                    truth_by_case,
+                )
+                result.update(
+                    {
+                        "method": "mlp",
+                        "hidden": hidden,
+                        "geometry_weight": geometry_weight,
+                        "class_weight_power": class_weight_power,
+                    }
+                )
+                results.append(result)
 
     best = max(results, key=lambda item: item["selection_score"])
     output = args.output or (
