@@ -112,10 +112,11 @@ def paste_case(
     mask_threshold: float,
     support_radius: int,
     use_refined_location: bool,
-) -> tuple[np.ndarray, list[int]]:
+) -> tuple[np.ndarray, list[int], np.ndarray]:
     shape = tuple(int(value) for value in case["shape_zyx"])
     output = np.zeros(shape, dtype=np.uint8)
     confidence = np.zeros(shape, dtype=np.float32)
+    touched_coordinates: list[np.ndarray] = []
     roi_shape = np.asarray(roi_size)
     for record in records:
         prediction = predictions[str(record["candidate_id"])]
@@ -161,7 +162,58 @@ def paste_case(
         )
         output[tuple(global_coordinates.T)] = class_id
         confidence[tuple(global_coordinates.T)] = voxel_confidence
-    return output, sorted(int(value) for value in np.unique(output) if value > 0)
+        touched_coordinates.append(global_coordinates)
+    touched = (
+        np.concatenate(touched_coordinates, axis=0)
+        if touched_coordinates else np.empty((0, 3), dtype=np.int64)
+    )
+    if touched.size:
+        touched = np.unique(touched, axis=0)
+        touched = touched[output[tuple(touched.T)] > 0]
+    locations = sorted(
+        int(value) for value in np.unique(output[tuple(touched.T)])
+        if value > 0
+    ) if touched.size else []
+    return output, locations, touched
+
+
+def sparse_task2_case_counts(
+    case: dict[str, Any],
+    ground_truth: np.ndarray,
+    prediction: np.ndarray,
+    predicted_locations: list[int],
+    touched: np.ndarray,
+) -> np.ndarray:
+    """Official class detection counts without scanning the full cache volume."""
+    ground_truth_classes = {
+        int(component["class_id"]) for component in case["components"]
+    }
+    prediction_classes = set(predicted_locations)
+    number_of_aneurysms = len(ground_truth_classes)
+    counts = np.zeros((52, 4), dtype=np.int64)
+    counts[:, 3] = number_of_aneurysms
+    sparse_truth = (
+        ground_truth[tuple(touched.T)] if touched.size
+        else np.empty(0, dtype=np.uint8)
+    )
+    sparse_prediction = (
+        prediction[tuple(touched.T)] if touched.size
+        else np.empty(0, dtype=np.uint8)
+    )
+    for class_id in sorted(ground_truth_classes | prediction_classes):
+        in_ground_truth = class_id in ground_truth_classes
+        in_prediction = class_id in prediction_classes
+        true_positive = bool(
+            in_ground_truth and in_prediction
+            and np.any((sparse_truth == class_id) & (sparse_prediction == class_id))
+        )
+        tp = int(true_positive)
+        fn = int(in_ground_truth and not true_positive)
+        counts[class_id - 1] = (
+            tp, int(in_prediction and not true_positive), fn,
+            number_of_aneurysms - (tp + fn)
+        )
+    return counts
 
 
 def evaluate_pair(
@@ -172,6 +224,7 @@ def evaluate_pair(
     predictions: dict[str, dict[str, Any]],
     roi_sizes: dict[int, tuple[int, int, int]],
     source_root: Path,
+    cache_root: Path,
     objectness_threshold: float,
     mask_threshold: float,
     support_radius: int,
@@ -185,21 +238,32 @@ def evaluate_pair(
     for case_id in tqdm(case_ids, desc=f"OOF obj={objectness_threshold:.2f} mask={mask_threshold:.2f}", leave=False):
         case = cases[case_id]
         fold = int(folds["case_to_fold"][case_id])
-        cache_prediction, locations = paste_case(
+        cache_prediction, locations, touched = paste_case(
             case, records_by_case.get(case_id, []), predictions, roi_sizes[fold],
             objectness_threshold, mask_threshold, support_radius,
             use_refined_location
         )
-        if case_id not in truth_cache:
-            truth, _ = load_zyx(source_root / "location_masks" / f"{case_id}.nii.gz")
-            truth_cache[case_id] = np.asarray(truth, dtype=np.uint8)
-        truth = truth_cache[case_id]
-        native_prediction = resize_to_shape(cache_prediction, truth.shape, order=0).astype(np.uint8)
         task1_counts.append(task1_case_counts(case["json_locations"], locations))
         if full:
+            key = f"native:{case_id}"
+            if key not in truth_cache:
+                truth, _ = load_zyx(source_root / "location_masks" / f"{case_id}.nii.gz")
+                truth_cache[key] = np.asarray(truth, dtype=np.uint8)
+            truth = truth_cache[key]
+            native_prediction = resize_to_shape(cache_prediction, truth.shape, order=0).astype(np.uint8)
             counts, segmentation = task2_case_metrics(truth, native_prediction)
         else:
-            counts = task2_case_counts(truth, native_prediction)
+            key = f"cache:{case_id}"
+            if key not in truth_cache:
+                truth_cache[key] = np.load(
+                    cache_root / str(case["cache_dir"]) / "location.npy",
+                    mmap_mode="r",
+                )
+            truth = truth_cache[key]
+            native_prediction = cache_prediction
+            counts = sparse_task2_case_counts(
+                case, truth, cache_prediction, locations, touched
+            )
             segmentation = np.zeros((52, 3), dtype=np.float64)
         task2_counts.append(counts)
         task2_segmentations.append(segmentation)
@@ -299,7 +363,8 @@ def main() -> None:
         for mask_threshold in sorted(set(args.mask_thresholds)):
             metrics, _ = evaluate_pair(
                 case_ids, cases, folds, records_by_case, predictions, roi_sizes,
-                source_root, objectness_threshold, mask_threshold,
+                source_root, Path(cache_index["index_path"]).parent,
+                objectness_threshold, mask_threshold,
                 args.support_radius_voxels, args.use_refined_location, False,
                 truth_cache,
             )
@@ -307,6 +372,7 @@ def main() -> None:
     best = max(sweep, key=lambda item: (item["detection_proxy"], -abs(item["objectness_threshold"] - 0.35), -abs(item["mask_threshold"] - 0.35)))
     final, per_case = evaluate_pair(
         case_ids, cases, folds, records_by_case, predictions, roi_sizes, source_root,
+        Path(cache_index["index_path"]).parent,
         float(best["objectness_threshold"]), float(best["mask_threshold"]),
         args.support_radius_voxels, args.use_refined_location, True,
         truth_cache,
