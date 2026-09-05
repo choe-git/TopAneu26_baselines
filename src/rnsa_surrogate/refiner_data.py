@@ -168,6 +168,7 @@ class CandidateROIDataset(Dataset[dict[str, torch.Tensor]]):
             if np.random.random() < 0.5:
                 inputs = np.flip(inputs, axis=-1).copy()
                 metadata[9] *= -1.0
+                flipped = True
                 stage1_class = int(
                     self.location_swap[int(record["stage1_class"])]
                 )
@@ -175,9 +176,11 @@ class CandidateROIDataset(Dataset[dict[str, torch.Tensor]]):
                     self.location_swap[int(record["target_class"])]
                 )
             else:
+                flipped = False
                 stage1_class = int(record["stage1_class"])
                 target_class = int(record["target_class"])
         else:
+            flipped = False
             stage1_class = int(record["stage1_class"])
             target_class = int(record["target_class"])
         return {
@@ -187,4 +190,5 @@ class CandidateROIDataset(Dataset[dict[str, torch.Tensor]]):
             "target_class": torch.tensor(target_class, dtype=torch.long),
             "stage1_class": torch.tensor(stage1_class, dtype=torch.long),
             "index": torch.tensor(int(item), dtype=torch.long),
+            "flipped": torch.tensor(flipped, dtype=torch.bool),
         }

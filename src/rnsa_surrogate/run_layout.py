@@ -82,6 +82,14 @@ class BaselineRunLayout:
         return self.refiner_location / "folds"
 
     @property
+    def roi_refiner(self) -> Path:
+        return self.baseline / "roi_refiner"
+
+    @property
+    def roi_refiner_folds(self) -> Path:
+        return self.roi_refiner / "folds"
+
+    @property
     def tensorboard(self) -> Path:
         return self.root / "tensorboard" / "baseline"
 
@@ -92,6 +100,10 @@ class BaselineRunLayout:
     @property
     def refiner_location_tensorboard(self) -> Path:
         return self.tensorboard / "refiner_location"
+
+    @property
+    def roi_refiner_tensorboard(self) -> Path:
+        return self.tensorboard / "roi_refiner"
 
     @property
     def predictions(self) -> Path:
