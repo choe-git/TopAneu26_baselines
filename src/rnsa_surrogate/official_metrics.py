@@ -139,6 +139,40 @@ def task2_case_metrics(
     return counts, segmentation
 
 
+def task2_case_counts(
+    ground_truth: np.ndarray, prediction: np.ndarray
+) -> np.ndarray:
+    """Return official Task 2 detection counts without costly surface metrics."""
+    ground_truth = np.asarray(ground_truth)
+    prediction = np.asarray(prediction)
+    if prediction.shape != ground_truth.shape:
+        raise ValueError(
+            f"Shape mismatch: GT={ground_truth.shape}; prediction={prediction.shape}"
+        )
+    counts = np.zeros((N_CLASSES, 4), dtype=np.int64)
+    ground_truth_classes = {int(value) for value in np.unique(ground_truth) if value}
+    prediction_classes = {int(value) for value in np.unique(prediction) if value}
+    number_of_aneurysms = len(ground_truth_classes)
+    counts[:, 3] = number_of_aneurysms
+    for class_id in sorted(ground_truth_classes | prediction_classes):
+        class_index = class_id - 1
+        in_ground_truth = class_id in ground_truth_classes
+        in_prediction = class_id in prediction_classes
+        true_positive = bool(
+            in_ground_truth
+            and in_prediction
+            and np.any(
+                (ground_truth == class_id) & (prediction == class_id)
+            )
+        )
+        tp = int(true_positive)
+        fp = int(in_prediction and not true_positive)
+        fn = int(in_ground_truth and not true_positive)
+        tn = number_of_aneurysms - (tp + fn)
+        counts[class_index] = tp, fp, fn, tn
+    return counts
+
+
 def _classification_summary(counts: np.ndarray) -> dict[str, Any]:
     per_class: dict[str, dict[str, float | int]] = {}
     precision_values, recall_values, mcc_values = [], [], []

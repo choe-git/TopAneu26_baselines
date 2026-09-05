@@ -25,6 +25,7 @@ from rnsa_surrogate.official_metrics import (
     summarize_task1,
     summarize_task2,
     task1_case_counts,
+    task2_case_counts,
     task2_case_metrics,
 )
 from rnsa_surrogate.refiner_candidates import candidate_coordinates
@@ -113,6 +114,7 @@ def evaluate_threshold(
     predictions: dict[str, dict[str, float | int]],
     source_root: Path,
     ground_truth_cache: dict[str, np.ndarray],
+    full_segmentation_metrics: bool = True,
     save_root: Path | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     task1_counts_list = []
@@ -161,7 +163,13 @@ def evaluate_threshold(
         task1_counts_list.append(
             task1_case_counts(case["json_locations"], predicted_locations)
         )
-        counts, segmentation = task2_case_metrics(ground_truth, prediction_mask)
+        if full_segmentation_metrics:
+            counts, segmentation = task2_case_metrics(
+                ground_truth, prediction_mask
+            )
+        else:
+            counts = task2_case_counts(ground_truth, prediction_mask)
+            segmentation = np.zeros((52, 3), dtype=np.float64)
         task2_counts_list.append(counts)
         task2_segmentation_list.append(segmentation)
         truth_binary = ground_truth > 0
@@ -317,6 +325,7 @@ def main() -> None:
             scores,
             source_root,
             ground_truth_cache,
+            False,
         )
         sweep.append(metrics)
     best = max(
@@ -336,6 +345,7 @@ def main() -> None:
         scores,
         source_root,
         ground_truth_cache,
+        True,
         output if args.save_predictions else None,
     )
     output.mkdir(parents=True, exist_ok=True)
