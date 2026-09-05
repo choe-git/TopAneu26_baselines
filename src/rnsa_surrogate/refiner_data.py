@@ -106,6 +106,7 @@ class CandidateROIDataset(Dataset[dict[str, torch.Tensor]]):
         index = load_cache_index(cache_dir)
         self.cache_root = str(Path(index["index_path"]).parent)
         self.cases = {str(case["case_id"]): case for case in index["cases"]}
+        self.location_swap = np.asarray(index["location_lr_swap"], dtype=np.int64)
         self.records = records
         self.roi_size = tuple(int(value) for value in roi_size)
         self.augment = bool(augment)
@@ -167,9 +168,23 @@ class CandidateROIDataset(Dataset[dict[str, torch.Tensor]]):
             if np.random.random() < 0.5:
                 inputs = np.flip(inputs, axis=-1).copy()
                 metadata[9] *= -1.0
+                stage1_class = int(
+                    self.location_swap[int(record["stage1_class"])]
+                )
+                target_class = int(
+                    self.location_swap[int(record["target_class"])]
+                )
+            else:
+                stage1_class = int(record["stage1_class"])
+                target_class = int(record["target_class"])
+        else:
+            stage1_class = int(record["stage1_class"])
+            target_class = int(record["target_class"])
         return {
             "image": torch.from_numpy(inputs.astype(np.float32, copy=False)),
             "metadata": torch.from_numpy(metadata),
             "target": torch.tensor(float(record["target"]), dtype=torch.float32),
+            "target_class": torch.tensor(target_class, dtype=torch.long),
+            "stage1_class": torch.tensor(stage1_class, dtype=torch.long),
             "index": torch.tensor(int(item), dtype=torch.long),
         }
