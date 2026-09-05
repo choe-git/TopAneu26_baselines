@@ -343,6 +343,12 @@ def main() -> None:
                 location_lr_swap=cache_index["location_lr_swap"],
             )
         )
+        if vessel_refiner is not None:
+            vessel = np.load(case_dir / "vessel.npy", mmap_mode="r")
+            cache_prediction = vessel_refiner.refine(cache_prediction, vessel)
+            predicted_locations = sorted(
+                int(value) for value in np.unique(cache_prediction) if value > 0
+            )
 
         ground_truth, ground_truth_metadata = load_zyx(
             location_mask_root / f"{case_id}.nii.gz"
@@ -378,12 +384,6 @@ def main() -> None:
             objectness["detected_ground_truth_components"],
             objectness["overlapping_prediction_components"],
         )
-        if vessel_refiner is not None:
-            vessel = np.load(case_dir / "vessel.npy", mmap_mode="r")
-            cache_prediction = vessel_refiner.refine(cache_prediction, vessel)
-            predicted_locations = sorted(
-                int(value) for value in np.unique(cache_prediction) if value > 0
-            )
         per_case.append(
             {
                 "case_id": case_id,
