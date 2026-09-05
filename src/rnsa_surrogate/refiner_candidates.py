@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -86,7 +87,10 @@ def extract_candidate_records(
 
 
 def atomic_save_candidate_artifact(
-    path: str | Path, coordinates: np.ndarray, offsets: np.ndarray
+    path: str | Path,
+    coordinates: np.ndarray,
+    offsets: np.ndarray,
+    vessel_rois: np.ndarray | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,11 +101,13 @@ def atomic_save_candidate_artifact(
             suffix=".tmp", delete=False
         ) as handle:
             temporary = Path(handle.name)
-            np.savez_compressed(
-                handle,
-                coordinates=np.asarray(coordinates, dtype=np.int32),
-                offsets=np.asarray(offsets, dtype=np.int64),
-            )
+            payload = {
+                "coordinates": np.asarray(coordinates, dtype=np.int32),
+                "offsets": np.asarray(offsets, dtype=np.int64),
+            }
+            if vessel_rois is not None:
+                payload["vessel_rois"] = np.asarray(vessel_rois, dtype=np.uint8)
+            np.savez_compressed(handle, **payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -117,3 +123,15 @@ def candidate_coordinates(path: str | Path, index: int) -> np.ndarray:
             raise IndexError(f"Candidate index {index} is absent from {path}")
         start, stop = int(offsets[index]), int(offsets[index + 1])
         return np.asarray(artifact["coordinates"][start:stop], dtype=np.int32)
+
+
+@lru_cache(maxsize=64)
+def _candidate_vessel_rois(path: str) -> np.ndarray:
+    with np.load(path, allow_pickle=False) as artifact:
+        if "vessel_rois" not in artifact:
+            raise ValueError(f"Candidate artifact has no vessel context: {path}")
+        return np.asarray(artifact["vessel_rois"], dtype=np.uint8)
+
+
+def candidate_vessel_roi(path: str | Path, index: int) -> np.ndarray:
+    return _candidate_vessel_rois(str(Path(path).resolve()))[index]

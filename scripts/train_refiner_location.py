@@ -66,10 +66,12 @@ def validated_manifests(
     folds: dict[str, Any],
     cache_sha: str,
     fold_sha: str,
+    candidate_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     manifests = []
     for fold in range(int(folds["n_folds"])):
-        path = layout.refiner_candidates / "oof" / f"fold_{fold}" / "manifest.json"
+        root = candidate_root or layout.refiner_candidates
+        path = root / "oof" / f"fold_{fold}" / "manifest.json"
         manifest = load_candidate_manifest(path)
         if int(manifest["fold"]) != fold:
             raise ValueError(f"Candidate manifest fold mismatch: {path}")

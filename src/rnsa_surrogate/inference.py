@@ -169,6 +169,7 @@ def sliding_window_predict(
     sphere_threshold: float = 0.5,
     sphere_support_threshold: float = 0.2,
     sphere_score_weight: float = 0.0,
+    return_vessel_segmentation: bool = False,
 ) -> tuple[np.ndarray, list[int], dict[str, np.ndarray]]:
     return ensemble_sliding_window_predict(
         [model],
@@ -225,6 +226,8 @@ def ensemble_sliding_window_predict(
         raise ValueError("At least one model is required")
     if tta_left_right and location_lr_swap is None:
         raise ValueError("location_lr_swap is required for left-right TTA")
+    if tta_left_right and return_vessel_segmentation:
+        raise ValueError("Vessel-context export currently requires TTA disabled")
     if presence_top_k <= 0 or presence_evidence_voxels <= 0:
         raise ValueError(
             "presence_top_k and presence_evidence_voxels must be positive"
@@ -249,6 +252,14 @@ def ensemble_sliding_window_predict(
     best_class = np.zeros(image.shape, dtype=np.uint8)
     patch_best_class = np.zeros(image.shape, dtype=np.uint8)
     patch_class_margin = np.zeros(image.shape, dtype=np.float32)
+    best_vessel = (
+        np.zeros(image.shape, dtype=np.uint8)
+        if return_vessel_segmentation else None
+    )
+    vessel_vote_margin = (
+        np.zeros(image.shape, dtype=np.float32)
+        if return_vessel_segmentation else None
+    )
     global_patch_scores: list[np.ndarray] = []
     aneurysm_patch_scores: list[float] = []
     modality_value = 1.0 if modality.lower() == "mr" else -1.0
@@ -291,6 +302,7 @@ def ensemble_sliding_window_predict(
                 aneurysm_probability_patch = None
                 component_location_probability_patch = None
                 sphere_probability_patch = None
+                vessel_probability_patch = None
                 for model in models:
                     for flipped in tta_variants:
                         member_input = tensor
@@ -321,6 +333,10 @@ def ensemble_sliding_window_predict(
                             if "sphere_logits" in outputs
                             else None
                         )
+                        member_vessel = (
+                            torch.softmax(outputs["vessel_logits"], dim=1)[0].float()
+                            if return_vessel_segmentation else None
+                        )
                         if "component_location_logits" in outputs:
                             member_component_location = torch.softmax(
                                 outputs["component_location_logits"][:, 1:53], dim=1
@@ -338,6 +354,8 @@ def ensemble_sliding_window_predict(
                                 ]
                             if member_sphere is not None:
                                 member_sphere = torch.flip(member_sphere, dims=(-1,))
+                            if member_vessel is not None:
+                                member_vessel = torch.flip(member_vessel, dims=(-1,))
                         if binary_probability_patch is None:
                             binary_probability_patch = member_binary
                             location_probability_patch = member_location
@@ -347,6 +365,7 @@ def ensemble_sliding_window_predict(
                                 member_component_location
                             )
                             sphere_probability_patch = member_sphere
+                            vessel_probability_patch = member_vessel
                         else:
                             binary_probability_patch += member_binary
                             location_probability_patch += member_location
@@ -366,6 +385,9 @@ def ensemble_sliding_window_predict(
                             if member_sphere is not None:
                                 assert sphere_probability_patch is not None
                                 sphere_probability_patch += member_sphere
+                            if member_vessel is not None:
+                                assert vessel_probability_patch is not None
+                                vessel_probability_patch += member_vessel
                 assert binary_probability_patch is not None
                 assert location_probability_patch is not None
                 assert global_probability_patch is not None
@@ -378,6 +400,8 @@ def ensemble_sliding_window_predict(
                     component_location_probability_patch /= members
                 if sphere_probability_patch is not None:
                     sphere_probability_patch /= members
+                if vessel_probability_patch is not None:
+                    vessel_probability_patch /= members
                 binary = binary_probability_patch.cpu().numpy()
                 global_probability = global_probability_patch
                 evidence_voxels = min(presence_evidence_voxels, binary.size)
@@ -417,6 +441,22 @@ def ensemble_sliding_window_predict(
                 class_score, class_index = location.max(dim=0)
                 class_score_array = class_score.cpu().numpy()
                 class_array = (class_index + 1).to(torch.uint8).cpu().numpy()
+                if vessel_probability_patch is not None:
+                    vessel_score, vessel_index = vessel_probability_patch.max(dim=0)
+                    vessel_score_array = vessel_score.cpu().numpy()
+                    vessel_array = vessel_index.to(torch.uint8).cpu().numpy()
+                    assert best_vessel is not None and vessel_vote_margin is not None
+                    current_vessel = best_vessel[region]
+                    current_vessel_margin = vessel_vote_margin[region]
+                    vessel_empty = current_vessel == 0
+                    vessel_same = vessel_empty | (current_vessel == vessel_array)
+                    current_vessel[vessel_empty] = vessel_array[vessel_empty]
+                    current_vessel_margin[vessel_same] += vessel_score_array[vessel_same]
+                    vessel_different = ~vessel_same
+                    current_vessel_margin[vessel_different] -= vessel_score_array[vessel_different]
+                    vessel_switch = vessel_different & (current_vessel_margin < 0)
+                    current_vessel[vessel_switch] = vessel_array[vessel_switch]
+                    current_vessel_margin[vessel_switch] *= -1
 
                 binary_sum[region] += binary
                 binary_count[region] += 1
@@ -495,4 +535,6 @@ def ensemble_sliding_window_predict(
     }
     if sphere_probability is not None:
         diagnostics["sphere_probability"] = sphere_probability
+    if best_vessel is not None:
+        diagnostics["vessel_segmentation"] = best_vessel[crop]
     return segmentation, task1, diagnostics

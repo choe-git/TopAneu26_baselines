@@ -48,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--variant", default="roi_refiner")
+    parser.add_argument("--candidate-variant", default="candidates")
+    parser.add_argument("--vessel-context", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args()
 
@@ -193,6 +195,8 @@ def main() -> None:
     args = parse_args()
     if not args.variant.replace("_", "").replace("-", "").isalnum():
         raise ValueError("--variant must be a simple directory name")
+    if not args.candidate_variant.replace("_", "").replace("-", "").isalnum():
+        raise ValueError("--candidate-variant must be a simple directory name")
     layout = BaselineRunLayout.from_root(args.run_dir)
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     settings = dict(config["roi_refiner"])
@@ -206,7 +210,10 @@ def main() -> None:
         raise ValueError(f"Invalid fold: {args.fold}")
     cache_index = load_cache_index(layout.cache)
     cache_sha, fold_sha = sha256_file(cache_index["index_path"]), sha256_file(folds_path)
-    manifests = validated_manifests(layout, folds, cache_sha, fold_sha)
+    candidate_root = layout.refiner / args.candidate_variant
+    manifests = validated_manifests(
+        layout, folds, cache_sha, fold_sha, candidate_root
+    )
     train_records = [
         record for fold, manifest in enumerate(manifests) if fold != args.fold
         for record in manifest_records(manifest)
@@ -224,10 +231,12 @@ def main() -> None:
     seed_everything(seed)
     roi_size = tuple(settings.get("roi_size", (48, 64, 64)))
     train_dataset = CandidateROIRefinementDataset(
-        layout.cache, train_records, roi_size, augment=True, seed=seed
+        layout.cache, train_records, roi_size, augment=True, seed=seed,
+        vessel_context=args.vessel_context,
     )
     val_dataset = CandidateROIRefinementDataset(
-        layout.cache, val_records, roi_size, augment=False, seed=seed + 10_000_000
+        layout.cache, val_records, roi_size, augment=False, seed=seed + 10_000_000,
+        vessel_context=args.vessel_context,
     )
     sampler = BalancedCandidateSampler(
         train_dataset, int(settings.get("train_samples", 768)),
@@ -241,7 +250,8 @@ def main() -> None:
     train_loader = DataLoader(train_dataset, sampler=sampler, **loader_options)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_options)
     model_config = dict(
-        in_channels=2, base_channels=int(settings.get("base_channels", 8)),
+        in_channels=4 if args.vessel_context else 2,
+        base_channels=int(settings.get("base_channels", 8)),
         metadata_features=11,
         embedding_channels=int(settings.get("embedding_channels", 16)),
         location_classes=52, dropout=float(settings.get("dropout", 0.15))
@@ -264,6 +274,8 @@ def main() -> None:
         "model": model_config, "cache_index_sha256": cache_sha,
         "fold_manifest_sha256": fold_sha,
         "candidate_manifest_sha256s": manifest_hashes,
+        "candidate_variant": args.candidate_variant,
+        "vessel_context": args.vessel_context,
     }
     contract_sha = config_digest(contract)
     output = layout.baseline / args.variant / "folds" / f"fold_{args.fold}"
@@ -282,6 +294,8 @@ def main() -> None:
                 "cache_index_sha256": cache_sha,
                 "fold_manifest_sha256": fold_sha,
                 "candidate_manifest_sha256s": manifest_hashes,
+                "candidate_variant": args.candidate_variant,
+                "vessel_context": args.vessel_context,
                 "selection": "maximum fixed-threshold mean(candidate MCC, positive location accuracy, positive mask Dice)",
                 "contract_sha256": contract_sha,
             },
@@ -322,6 +336,8 @@ def main() -> None:
                 "stage": "roi_refiner", "fold": args.fold, "epoch": epoch,
                 "model": model.state_dict(), "model_config": model_config,
                 "roi_size": list(roi_size), "settings": settings,
+                "candidate_variant": args.candidate_variant,
+                "vessel_context": args.vessel_context,
                 "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                 "best_validation_score": best_score, "contract_sha256": contract_sha,
                 "candidate_manifest_sha256s": manifest_hashes,

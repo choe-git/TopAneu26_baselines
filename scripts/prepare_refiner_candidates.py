@@ -16,6 +16,7 @@ from rnsa_surrogate.cache import (
     load_cache_index,
     sha256_file,
 )
+from rnsa_surrogate.data import extract_patch
 from rnsa_surrogate.inference import ensemble_sliding_window_predict
 from rnsa_surrogate.model import RNSASurrogate
 from rnsa_surrogate.refiner_candidates import (
@@ -40,6 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-component-voxels", type=int)
     parser.add_argument("--maximum-components", type=int)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--candidate-variant", default="candidates")
+    parser.add_argument("--with-vessel-context", action="store_true")
+    parser.add_argument("--vessel-roi-size", type=int, nargs=3, default=[48, 64, 64])
     return parser.parse_args()
 
 
@@ -70,6 +74,8 @@ def load_stage1(
 
 def main() -> None:
     args = parse_args()
+    if not args.candidate_variant.replace("_", "").replace("-", "").isalnum():
+        raise ValueError("--candidate-variant must be a simple directory name")
     layout = BaselineRunLayout.from_root(args.run_dir)
     cache_index = load_cache_index(layout.cache)
     cache_sha = sha256_file(cache_index["index_path"])
@@ -96,7 +102,8 @@ def main() -> None:
         model, config, checkpoint = load_stage1(checkpoint_path, fold, device)
         if checkpoint.get("cache_index_sha256") != cache_sha:
             raise ValueError(f"Fold {fold} checkpoint was trained from another cache")
-        output = layout.refiner_candidates / "oof" / f"fold_{fold}"
+        candidate_root = layout.refiner / args.candidate_variant
+        output = candidate_root / "oof" / f"fold_{fold}"
         manifest_path = output / "manifest.json"
         if manifest_path.exists() and not args.overwrite:
             raise FileExistsError(manifest_path)
@@ -187,6 +194,7 @@ def main() -> None:
                 ],
                 tta_left_right=args.tta_left_right,
                 location_lr_swap=cache_index["location_lr_swap"],
+                return_vessel_segmentation=args.with_vessel_context,
             )
             records, coordinates, offsets = extract_candidate_records(
                 case_id,
@@ -195,10 +203,25 @@ def main() -> None:
                 np.asarray(truth),
             )
             artifact = Path("cases") / f"{case_id}.npz"
-            atomic_save_candidate_artifact(output / artifact, coordinates, offsets)
+            vessel_rois = None
+            if args.with_vessel_context:
+                vessel_prediction = diagnostics["vessel_segmentation"]
+                vessel_rois = np.stack([
+                    extract_patch(
+                        vessel_prediction,
+                        tuple(int(round(float(v))) for v in record["center_zyx"]),
+                        tuple(args.vessel_roi_size),
+                        pad_value=0,
+                    )[0]
+                    for record in records
+                ]) if records else np.empty((0, *args.vessel_roi_size), dtype=np.uint8)
+            atomic_save_candidate_artifact(
+                output / artifact, coordinates, offsets, vessel_rois
+            )
             for record in records:
                 record["artifact"] = artifact.as_posix()
                 record["generator_fold"] = fold
+                record["vessel_context"] = bool(args.with_vessel_context)
                 if int(record["generator_fold"]) != int(
                     fold_manifest["case_to_fold"][case_id]
                 ):
@@ -223,6 +246,9 @@ def main() -> None:
             "stage1_checkpoint_sha256": sha256_file(checkpoint_path),
             "stage1_checkpoint_epoch": int(checkpoint["epoch"]),
             "inference": inference_settings,
+            "candidate_variant": args.candidate_variant,
+            "vessel_context": bool(args.with_vessel_context),
+            "vessel_roi_size": list(args.vessel_roi_size),
             "inference_sha256": config_digest(inference_settings),
             "leakage_guard": (
                 "Every case is generated only by the stage1 checkpoint whose "

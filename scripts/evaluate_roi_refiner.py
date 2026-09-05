@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--variant", default="roi_refiner")
+    parser.add_argument("--candidate-variant", default="candidates")
     parser.add_argument("--folds", type=int, nargs="+", default=[4])
     parser.add_argument("--device", choices=("cuda", "cpu", "auto"), default="cuda")
     parser.add_argument(
@@ -323,6 +324,8 @@ def main() -> None:
     args = parse_args()
     if not args.variant.replace("_", "").replace("-", "").isalnum():
         raise ValueError("--variant must be a simple directory name")
+    if not args.candidate_variant.replace("_", "").replace("-", "").isalnum():
+        raise ValueError("--candidate-variant must be a simple directory name")
     if any(not 0 <= value <= 1 for value in args.objectness_thresholds + args.mask_thresholds):
         raise ValueError("Thresholds must be in [0, 1]")
     layout = BaselineRunLayout.from_root(args.run_dir)
@@ -347,7 +350,10 @@ def main() -> None:
     roi_sizes: dict[int, tuple[int, int, int]] = {}
     checkpoint_paths, manifest_paths = [], []
     for fold in args.folds:
-        manifest_path = layout.refiner_candidates / "oof" / f"fold_{fold}" / "manifest.json"
+        manifest_path = (
+            layout.refiner / args.candidate_variant
+            / "oof" / f"fold_{fold}" / "manifest.json"
+        )
         manifest = load_candidate_manifest(manifest_path)
         if int(manifest["fold"]) != fold or manifest["cache_index_sha256"] != cache_sha or manifest["fold_manifest_sha256"] != fold_sha:
             raise ValueError(f"Candidate provenance mismatch: {manifest_path}")
@@ -367,7 +373,10 @@ def main() -> None:
         model.to(device)
         roi_size = tuple(int(value) for value in checkpoint["roi_size"])
         roi_sizes[fold] = roi_size
-        dataset = CandidateROIRefinementDataset(layout.cache, records, roi_size, augment=False)
+        dataset = CandidateROIRefinementDataset(
+            layout.cache, records, roi_size, augment=False,
+            vessel_context=bool(checkpoint.get("vessel_context", False)),
+        )
         predictions.update(predict_records(model, dataset, device, args.batch_size))
         checkpoint_paths.append(str(checkpoint_path.resolve()))
         manifest_paths.append(str(manifest_path.resolve()))

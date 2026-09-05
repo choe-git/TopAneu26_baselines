@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from .data import extract_patch
-from .refiner_candidates import candidate_coordinates
+from .refiner_candidates import candidate_coordinates, candidate_vessel_roi
 from .refiner_data import CandidateROIDataset
 from .refiner_model import RefinerBlock
 
@@ -20,6 +20,13 @@ from .refiner_model import RefinerBlock
 def _cached_instances(cache_root: str, cache_directory: str) -> np.ndarray:
     return np.load(
         Path(cache_root) / cache_directory / "instances.npy", mmap_mode="r"
+    )
+
+
+@lru_cache(maxsize=8)
+def _cached_vessel(cache_root: str, cache_directory: str) -> np.ndarray:
+    return np.load(
+        Path(cache_root) / cache_directory / "vessel.npy", mmap_mode="r"
     )
 
 
@@ -33,6 +40,10 @@ def roi_start(record: dict[str, Any], roi_size: Sequence[int]) -> tuple[int, int
 
 class CandidateROIRefinementDataset(CandidateROIDataset):
     """Adds the GT instance matched by a stage-1 component as a dense target."""
+
+    def __init__(self, *args: Any, vessel_context: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.vessel_context = bool(vessel_context)
 
     def __getitem__(self, item: int) -> dict[str, torch.Tensor]:
         sample = super().__getitem__(item)
@@ -76,6 +87,34 @@ class CandidateROIRefinementDataset(CandidateROIDataset):
         if bool(sample["flipped"]):
             target = np.flip(target, axis=-1).copy()
             valid = np.flip(valid, axis=-1).copy()
+        if self.vessel_context:
+            if record.get("vessel_context"):
+                vessel = candidate_vessel_roi(
+                    record["_artifact_path"], int(record["artifact_index"])
+                )
+            else:
+                vessel_volume = _cached_vessel(
+                    self.cache_root, str(case["cache_dir"])
+                )
+                vessel, _ = extract_patch(
+                    vessel_volume,
+                    tuple(int(round(float(value))) for value in record["center_zyx"]),
+                    self.roi_size,
+                    pad_value=0,
+                )
+            if vessel.shape != self.roi_size:
+                raise ValueError(
+                    f"Vessel ROI shape {vessel.shape} differs from {self.roi_size}"
+                )
+            if bool(sample["flipped"]):
+                vessel = np.flip(vessel, axis=-1).copy()
+            vessel_channels = np.stack([
+                (vessel > 0).astype(np.float32),
+                vessel.astype(np.float32) / 36.0,
+            ])
+            sample["image"] = torch.cat(
+                [sample["image"], torch.from_numpy(vessel_channels)], dim=0
+            )
         sample["target_mask"] = torch.from_numpy(target[None])
         sample["valid_mask"] = torch.from_numpy(valid[None])
         return sample
