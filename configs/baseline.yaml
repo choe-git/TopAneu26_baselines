@@ -32,6 +32,19 @@ ensemble:
   n_folds: 5
   fold_epochs: 150
   tta_left_right: true
+refiner:
+  roi_size: [48, 64, 64]
+  base_channels: 12
+  dropout: 0.15
+  epochs: 20
+  train_samples: 512
+  positive_fraction: 0.50
+  batch_size: 8
+  num_workers: 2
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  amp: bf16
+  selection_threshold: 0.50
 train:
   epochs: 150
   batch_size: 1

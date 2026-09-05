@@ -1,0 +1,214 @@
+"""Generate leakage-safe stage-1 OOF components for refiner training."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from rnsa_surrogate.cache import (
+    atomic_json_dump,
+    load_cache_index,
+    sha256_file,
+)
+from rnsa_surrogate.inference import ensemble_sliding_window_predict
+from rnsa_surrogate.model import RNSASurrogate
+from rnsa_surrogate.refiner_candidates import (
+    CANDIDATE_VERSION,
+    atomic_save_candidate_artifact,
+    extract_candidate_records,
+)
+from rnsa_surrogate.run_layout import BaselineRunLayout
+from rnsa_surrogate.runtime import config_digest
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--folds", type=int, nargs="+")
+    parser.add_argument("--device", choices=("cuda", "cpu", "auto"), default="cuda")
+    parser.add_argument("--tta-left-right", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    return parser.parse_args()
+
+
+def load_stage1(
+    path: Path, expected_fold: int, device: torch.device
+) -> tuple[RNSASurrogate, dict[str, Any], dict[str, Any]]:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if checkpoint.get("stage") != "aneurysm_fold":
+        raise ValueError(f"Not a fold checkpoint: {path}")
+    if int(checkpoint.get("fold", -1)) != expected_fold:
+        raise ValueError(
+            f"Checkpoint fold {checkpoint.get('fold')} cannot generate fold "
+            f"{expected_fold} OOF candidates"
+        )
+    config = checkpoint["config"]
+    model = RNSASurrogate(**config["model"])
+    state = dict(checkpoint["model"])
+    if "ema" in checkpoint:
+        state.update(
+            {
+                name: value.to(dtype=state[name].dtype)
+                for name, value in checkpoint["ema"]["shadow"].items()
+            }
+        )
+    model.load_state_dict(state)
+    return model.to(device).eval(), config, checkpoint
+
+
+def main() -> None:
+    args = parse_args()
+    layout = BaselineRunLayout.from_root(args.run_dir)
+    cache_index = load_cache_index(layout.cache)
+    cache_sha = sha256_file(cache_index["index_path"])
+    fold_manifest_path = layout.fold_manifest.resolve()
+    fold_manifest = json.loads(fold_manifest_path.read_text(encoding="utf-8"))
+    if fold_manifest.get("cache_index_sha256") != cache_sha:
+        raise ValueError("Fold manifest and current cache have different SHA256")
+    requested = args.device
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable")
+    device = torch.device(requested)
+    selected = args.folds or list(range(int(fold_manifest["n_folds"])))
+    case_by_id = {str(case["case_id"]): case for case in cache_index["cases"]}
+    cache_root = Path(cache_index["index_path"]).parent
+
+    for fold in selected:
+        if not 0 <= fold < int(fold_manifest["n_folds"]):
+            raise ValueError(f"Invalid fold: {fold}")
+        checkpoint_path = (
+            layout.folds / f"fold_{fold}" / "checkpoint_best.pth"
+        ).resolve()
+        model, config, checkpoint = load_stage1(checkpoint_path, fold, device)
+        if checkpoint.get("cache_index_sha256") != cache_sha:
+            raise ValueError(f"Fold {fold} checkpoint was trained from another cache")
+        output = layout.refiner_candidates / "oof" / f"fold_{fold}"
+        manifest_path = output / "manifest.json"
+        if manifest_path.exists() and not args.overwrite:
+            raise FileExistsError(manifest_path)
+        output.mkdir(parents=True, exist_ok=True)
+        case_ids = [str(value) for value in fold_manifest["folds"][str(fold)]]
+        for case_id in case_ids:
+            assigned = int(fold_manifest["case_to_fold"][case_id])
+            if assigned != fold:
+                raise AssertionError(
+                    f"{case_id} belongs to fold {assigned}, not generator fold {fold}"
+                )
+        settings = config.get("validation", {})
+        inference_settings = {
+            "overlap": float(settings.get("overlap", 0.5)),
+            "mask_threshold": float(settings.get("mask_threshold", 0.45)),
+            "presence_threshold": float(settings.get("presence_threshold", 0.35)),
+            "presence_top_k": int(settings.get("presence_top_k", 3)),
+            "presence_evidence_voxels": int(
+                settings.get("presence_evidence_voxels", 64)
+            ),
+            "minimum_component_voxels": int(
+                settings.get("minimum_component_voxels", 5)
+            ),
+            "maximum_components": int(settings.get("maximum_components", 5)),
+            "component_location_weight": float(
+                settings.get("component_location_weight", 0.0)
+            ),
+            "tta_left_right": bool(args.tta_left_right),
+        }
+        amp_name = str(config["train"].get("amp", "none"))
+        amp_dtype = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": None,
+            "none": None,
+        }[amp_name]
+        if device.type != "cuda":
+            amp_dtype = None
+        all_records: list[dict[str, Any]] = []
+        positives = 0
+        for case_id in tqdm(case_ids, desc=f"Refiner OOF candidates fold {fold}"):
+            case = case_by_id[case_id]
+            case_dir = cache_root / case["cache_dir"]
+            image = np.load(case_dir / "image.npy", mmap_mode="r").astype(np.float32)
+            truth = np.load(case_dir / "location.npy", mmap_mode="r")
+            segmentation, _, diagnostics = ensemble_sliding_window_predict(
+                [model],
+                image,
+                str(case["modality"]),
+                config["data"]["patch_size"],
+                device,
+                overlap=inference_settings["overlap"],
+                amp_dtype=amp_dtype,
+                mask_threshold=inference_settings["mask_threshold"],
+                presence_threshold=inference_settings["presence_threshold"],
+                presence_top_k=inference_settings["presence_top_k"],
+                presence_evidence_voxels=inference_settings[
+                    "presence_evidence_voxels"
+                ],
+                minimum_component_voxels=inference_settings[
+                    "minimum_component_voxels"
+                ],
+                maximum_components=inference_settings["maximum_components"],
+                component_location_weight=inference_settings[
+                    "component_location_weight"
+                ],
+                tta_left_right=args.tta_left_right,
+                location_lr_swap=cache_index["location_lr_swap"],
+            )
+            records, coordinates, offsets = extract_candidate_records(
+                case_id,
+                segmentation,
+                diagnostics["binary_probability"],
+                np.asarray(truth),
+            )
+            artifact = Path("cases") / f"{case_id}.npz"
+            atomic_save_candidate_artifact(output / artifact, coordinates, offsets)
+            for record in records:
+                record["artifact"] = artifact.as_posix()
+                record["generator_fold"] = fold
+                if int(record["generator_fold"]) != int(
+                    fold_manifest["case_to_fold"][case_id]
+                ):
+                    raise AssertionError("OOF generator leakage detected")
+            all_records.extend(records)
+            positives += sum(int(record["target"]) for record in records)
+        payload = {
+            "candidate_version": CANDIDATE_VERSION,
+            "mode": "stage1_oof",
+            "fold": fold,
+            "case_ids": case_ids,
+            "cases": len(case_ids),
+            "candidates": all_records,
+            "candidate_count": len(all_records),
+            "positive_candidates": positives,
+            "negative_candidates": len(all_records) - positives,
+            "cache_index": cache_index["index_path"],
+            "cache_index_sha256": cache_sha,
+            "fold_manifest": str(fold_manifest_path),
+            "fold_manifest_sha256": sha256_file(fold_manifest_path),
+            "stage1_checkpoint": str(checkpoint_path),
+            "stage1_checkpoint_sha256": sha256_file(checkpoint_path),
+            "stage1_checkpoint_epoch": int(checkpoint["epoch"]),
+            "inference": inference_settings,
+            "inference_sha256": config_digest(inference_settings),
+            "leakage_guard": (
+                "Every case is generated only by the stage1 checkpoint whose "
+                "held-out fold equals the case fold."
+            ),
+        }
+        atomic_json_dump(payload, manifest_path)
+        print(
+            f"Fold {fold}: {len(all_records)} candidates "
+            f"({positives} positive) -> {manifest_path}"
+        )
+
+
+if __name__ == "__main__":
+    main()

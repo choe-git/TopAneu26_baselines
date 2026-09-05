@@ -62,8 +62,24 @@ class BaselineRunLayout:
         return self.baseline / "ensemble"
 
     @property
+    def refiner(self) -> Path:
+        return self.baseline / "refiner"
+
+    @property
+    def refiner_candidates(self) -> Path:
+        return self.refiner / "candidates"
+
+    @property
+    def refiner_folds(self) -> Path:
+        return self.refiner / "folds"
+
+    @property
     def tensorboard(self) -> Path:
         return self.root / "tensorboard" / "baseline"
+
+    @property
+    def refiner_tensorboard(self) -> Path:
+        return self.tensorboard / "refiner"
 
     @property
     def predictions(self) -> Path:
