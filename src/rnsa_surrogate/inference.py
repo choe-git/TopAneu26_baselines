@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 from scipy.ndimage import find_objects
 from scipy.ndimage import label as connected_components
 
@@ -336,7 +337,15 @@ def ensemble_sliding_window_predict(
                             else None
                         )
                         member_vessel = (
-                            torch.softmax(outputs["vessel_logits"], dim=1)[0].float()
+                            torch.softmax(
+                                F.interpolate(
+                                    outputs["vessel_logits"].float(),
+                                    size=member_binary.shape,
+                                    mode="trilinear",
+                                    align_corners=False,
+                                ),
+                                dim=1,
+                            )[0]
                             if return_vessel_segmentation else None
                         )
                         if "component_location_logits" in outputs:
