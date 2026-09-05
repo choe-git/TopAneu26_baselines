@@ -30,6 +30,7 @@ from rnsa_surrogate.official_metrics import (
     task2_case_metrics,
 )
 from rnsa_surrogate.run_layout import BaselineRunLayout
+from rnsa_surrogate.vessel_refiner import VesselKNNRefiner
 
 OFFICIAL_EVALUATION_URL = "https://github.com/Bangulli/TopAneu-26/tree/main/eval"
 
@@ -100,6 +101,14 @@ def parse_args() -> argparse.Namespace:
         "--save-predictions", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--oracle-vessel-refiner-fold",
+        type=int,
+        help=(
+            "OOF-only diagnostic: relabel predicted components with cached organizer "
+            "vessels and a fold-trained kNN refiner"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -195,6 +204,8 @@ def main() -> None:
         raise ValueError("--oof requires --ensemble-folds")
     if args.oof and args.checkpoint is not None:
         raise ValueError("--oof cannot be combined with --checkpoint")
+    if args.oracle_vessel_refiner_fold is not None and not args.oof:
+        raise ValueError("--oracle-vessel-refiner-fold is restricted to --oof")
     if args.ensemble_folds is not None:
         if len(set(args.ensemble_folds)) != len(args.ensemble_folds):
             raise ValueError("--ensemble-folds contains duplicates")
@@ -206,9 +217,17 @@ def main() -> None:
             ).resolve()
             for fold in args.ensemble_folds
         ]
-        default_output = layout.ensemble / "evaluation" / (
-            "oof" if args.oof else args.split
-        )
+        if args.oracle_vessel_refiner_fold is not None:
+            default_output = (
+                layout.ensemble
+                / "ablation"
+                / "vessel_refiner_oracle"
+                / f"fold_{args.oracle_vessel_refiner_fold}"
+            )
+        else:
+            default_output = layout.ensemble / "evaluation" / (
+                "oof" if args.oof else args.split
+            )
     else:
         checkpoint_paths = [(args.checkpoint or layout.checkpoint).resolve()]
         default_output = layout.baseline / "evaluation" / args.split
@@ -264,6 +283,22 @@ def main() -> None:
     if not cases:
         raise ValueError(f"Cache contains no {evaluation_split!r} cases")
     cache_root = Path(cache_index["index_path"]).parent
+    vessel_refiner = None
+    if args.oracle_vessel_refiner_fold is not None:
+        refiner_fold = int(args.oracle_vessel_refiner_fold)
+        if args.ensemble_folds != [refiner_fold]:
+            raise ValueError(
+                "Oracle vessel refiner requires exactly its matching OOF fold model"
+            )
+        development_ids = set(case_to_fold)
+        refiner_validation_ids = {
+            case_id for case_id, fold in case_to_fold.items() if fold == refiner_fold
+        }
+        vessel_refiner = VesselKNNRefiner.fit(
+            cache_index,
+            cache_root,
+            development_ids - refiner_validation_ids,
+        )
     source_root = (args.source or Path(cache_index["source_root"])).resolve()
     location_mask_root = source_root / "location_masks"
     if not location_mask_root.is_dir():
@@ -343,6 +378,12 @@ def main() -> None:
             objectness["detected_ground_truth_components"],
             objectness["overlapping_prediction_components"],
         )
+        if vessel_refiner is not None:
+            vessel = np.load(case_dir / "vessel.npy", mmap_mode="r")
+            cache_prediction = vessel_refiner.refine(cache_prediction, vessel)
+            predicted_locations = sorted(
+                int(value) for value in np.unique(cache_prediction) if value > 0
+            )
         per_case.append(
             {
                 "case_id": case_id,
@@ -426,6 +467,16 @@ def main() -> None:
             "location_probability": "conditional softmax over classes 1..52",
             "location_overlap": "component-level weighted vote",
             "task1_aggregation": "retained aneurysm component labels",
+            "oracle_vessel_refiner": (
+                {
+                    "fold": args.oracle_vessel_refiner_fold,
+                    "neighbors": 3,
+                    "geometry_weight": 0.5,
+                    "warning": "OOF diagnostic uses organizer vessel masks; not deployable",
+                }
+                if vessel_refiner is not None
+                else None
+            ),
         },
         "official_task1": summarize_task1(task1_counts_per_case),
         "official_task2": summarize_task2(
