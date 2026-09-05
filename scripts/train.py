@@ -81,8 +81,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cache", type=Path, help="Override RUN_DIR/cache")
     parser.add_argument("--device", choices=("cuda", "cpu", "auto"))
-    parser.add_argument(
+    restart = parser.add_mutually_exclusive_group()
+    restart.add_argument(
         "--resume", type=Path, help="Resume checkpoint_latest.pth in place"
+    )
+    restart.add_argument(
+        "--initialize-from",
+        type=Path,
+        help="Initialize model/EMA weights from an aneurysm checkpoint and reset training state",
     )
     parser.add_argument("--fold", type=int, help="Cross-validation fold index")
     parser.add_argument(
@@ -90,6 +96,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pretrained", type=Path, help="Override fold vessel checkpoint"
+    )
+    parser.add_argument(
+        "--variant",
+        help="Store a fold experiment under baseline/variants/NAME instead of the canonical fold",
     )
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args()
@@ -435,6 +445,19 @@ def main() -> None:
         config.setdefault("validation", {})["max_cases"] = 1
 
     resume_path = args.resume.resolve() if args.resume is not None else None
+    initialize_path = (
+        args.initialize_from.resolve() if args.initialize_from is not None else None
+    )
+    if args.variant is not None and (
+        not args.variant
+        or any(
+            c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for c in args.variant
+        )
+    ):
+        raise ValueError(
+            "--variant may contain only letters, digits, underscores, and hyphens"
+        )
     if args.run_dir is not None:
         layout = BaselineRunLayout.from_root(args.run_dir)
         run_root = layout.root
@@ -442,6 +465,22 @@ def main() -> None:
         if args.fold is None:
             model_dir = layout.baseline
             tensorboard_dir = layout.tensorboard
+        elif args.variant is not None:
+            model_dir = (
+                layout.baseline
+                / "variants"
+                / args.variant
+                / "folds"
+                / f"fold_{args.fold}"
+            )
+            tensorboard_dir = (
+                layout.tensorboard
+                / "baseline"
+                / "variants"
+                / args.variant
+                / "folds"
+                / f"fold_{args.fold}"
+            )
         else:
             model_dir = layout.folds / f"fold_{args.fold}"
             tensorboard_dir = layout.tensorboard / "folds" / f"fold_{args.fold}"
@@ -502,6 +541,9 @@ def main() -> None:
             "pretrained_sha256": (
                 sha256_file(pretrained_path) if pretrained_path is not None else None
             ),
+            "initialization_sha256": (
+                sha256_file(initialize_path) if initialize_path is not None else None
+            ),
         }
     contract_sha256 = config_digest(contract)
     checkpoint: dict[str, Any] | None = None
@@ -538,6 +580,9 @@ def main() -> None:
                 ),
                 "pretrained_checkpoint": (
                     str(pretrained_path) if pretrained_path is not None else None
+                ),
+                "initialization_checkpoint": (
+                    str(initialize_path) if initialize_path is not None else None
                 ),
             },
             model_dir / "inputs.json",
@@ -586,7 +631,29 @@ def main() -> None:
     )
 
     model = RNSASurrogate(**config["model"]).to(device)
-    if checkpoint is None and pretrained_path is not None:
+    if checkpoint is None and initialize_path is not None:
+        source_checkpoint = torch.load(
+            initialize_path, map_location="cpu", weights_only=False
+        )
+        if source_checkpoint.get("stage") not in {"aneurysm_fold", "baseline"}:
+            raise ValueError(f"Not an aneurysm checkpoint: {initialize_path}")
+        source_state = dict(source_checkpoint["model"])
+        if "ema" in source_checkpoint:
+            source_state.update(source_checkpoint["ema"]["shadow"])
+        model.load_state_dict(source_state, strict=True)
+        atomic_json_dump(
+            {
+                "checkpoint": str(initialize_path),
+                "checkpoint_sha256": sha256_file(initialize_path),
+                "source_stage": source_checkpoint.get("stage"),
+                "source_fold": source_checkpoint.get("fold"),
+                "source_epoch": source_checkpoint.get("epoch"),
+                "weights": "ema" if "ema" in source_checkpoint else "model",
+                "optimizer_reset": True,
+            },
+            model_dir / "initialization.json",
+        )
+    elif checkpoint is None and pretrained_path is not None:
         vessel_checkpoint = torch.load(
             pretrained_path, map_location="cpu", weights_only=False
         )
