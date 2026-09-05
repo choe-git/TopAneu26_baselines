@@ -86,6 +86,7 @@ roi_refiner:
   tversky_beta: 0.70
   fixed_objectness_threshold: 0.35
   fixed_mask_threshold: 0.35
+  location_prior_logit: 3.0
 train:
   epochs: 150
   batch_size: 1

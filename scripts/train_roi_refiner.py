@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("cuda", "cpu", "auto"), default="cuda")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--variant", default="roi_refiner")
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args()
 
@@ -190,6 +191,8 @@ def run_epoch(
 
 def main() -> None:
     args = parse_args()
+    if not args.variant.replace("_", "").replace("-", "").isalnum():
+        raise ValueError("--variant must be a simple directory name")
     layout = BaselineRunLayout.from_root(args.run_dir)
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     settings = dict(config["roi_refiner"])
@@ -242,6 +245,7 @@ def main() -> None:
         metadata_features=11,
         embedding_channels=int(settings.get("embedding_channels", 16)),
         location_classes=52, dropout=float(settings.get("dropout", 0.15))
+        , location_prior_logit=float(settings.get("location_prior_logit", 0.0))
     )
     model = CandidateROIRefiner(**model_config).to(device)
     optimizer = torch.optim.AdamW(
@@ -262,7 +266,7 @@ def main() -> None:
         "candidate_manifest_sha256s": manifest_hashes,
     }
     contract_sha = config_digest(contract)
-    output = layout.roi_refiner_folds / f"fold_{args.fold}"
+    output = layout.baseline / args.variant / "folds" / f"fold_{args.fold}"
     resume = args.resume.resolve() if args.resume else None
     start_epoch, best_score = 0, float("-inf")
     if resume is None:
@@ -299,7 +303,7 @@ def main() -> None:
         output / "model.json",
     )
     writer = SummaryWriter(
-        layout.roi_refiner_tensorboard / "folds" / f"fold_{args.fold}",
+        layout.tensorboard / args.variant / "folds" / f"fold_{args.fold}",
         purge_step=start_epoch + 1,
     )
     status = output / "status.json"

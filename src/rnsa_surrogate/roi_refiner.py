@@ -92,6 +92,7 @@ class CandidateROIRefiner(nn.Module):
         embedding_channels: int = 16,
         location_classes: int = 52,
         dropout: float = 0.15,
+        location_prior_logit: float = 0.0,
     ) -> None:
         super().__init__()
         c0, c1, c2, c3 = (base_channels * value for value in (1, 2, 4, 8))
@@ -126,6 +127,7 @@ class CandidateROIRefiner(nn.Module):
         )
         self.objectness_head = nn.Linear(c3, 1)
         self.location_head = nn.Linear(c3, location_classes + 1)
+        self.location_prior_logit = float(location_prior_logit)
 
     def forward(
         self,
@@ -151,8 +153,21 @@ class CandidateROIRefiner(nn.Module):
             ],
             dim=1,
         ))
+        location_logits = self.location_head(fused)
+        if self.location_prior_logit:
+            prior = torch.zeros_like(location_logits)
+            prior.scatter_(
+                1, stage1_class[:, None],
+                torch.full(
+                    (stage1_class.shape[0], 1),
+                    self.location_prior_logit,
+                    dtype=location_logits.dtype,
+                    device=location_logits.device,
+                ),
+            )
+            location_logits = location_logits + prior
         return {
             "mask_logits": self.mask_head(d0),
             "objectness_logits": self.objectness_head(fused).squeeze(1),
-            "location_logits": self.location_head(fused),
+            "location_logits": location_logits,
         }

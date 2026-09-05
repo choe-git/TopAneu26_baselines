@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--variant", default="roi_refiner")
     parser.add_argument("--folds", type=int, nargs="+", default=[4])
     parser.add_argument("--device", choices=("cuda", "cpu", "auto"), default="cuda")
     parser.add_argument(
@@ -320,10 +321,13 @@ def evaluate_pair(
 
 def main() -> None:
     args = parse_args()
+    if not args.variant.replace("_", "").replace("-", "").isalnum():
+        raise ValueError("--variant must be a simple directory name")
     if any(not 0 <= value <= 1 for value in args.objectness_thresholds + args.mask_thresholds):
         raise ValueError("Thresholds must be in [0, 1]")
     layout = BaselineRunLayout.from_root(args.run_dir)
-    output = (args.output or layout.roi_refiner / "oof_evaluation").resolve()
+    variant_root = layout.baseline / args.variant
+    output = (args.output or variant_root / "oof_evaluation").resolve()
     if (output / "metrics.json").exists() and not args.overwrite:
         raise FileExistsError(output / "metrics.json")
     cache_index = load_cache_index(layout.cache)
@@ -352,7 +356,7 @@ def main() -> None:
             if int(record["generator_fold"]) != fold:
                 raise ValueError(f"Leaked candidate generator: {record['candidate_id']}")
             records_by_case.setdefault(str(record["case_id"]), []).append(record)
-        checkpoint_path = layout.roi_refiner_folds / f"fold_{fold}" / "checkpoint_best.pth"
+        checkpoint_path = variant_root / "folds" / f"fold_{fold}" / "checkpoint_best.pth"
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         if checkpoint.get("stage") != "roi_refiner" or int(checkpoint["fold"]) != fold or checkpoint["cache_index_sha256"] != cache_sha or checkpoint["fold_manifest_sha256"] != fold_sha:
             raise ValueError(f"ROI refiner checkpoint provenance mismatch: {checkpoint_path}")
