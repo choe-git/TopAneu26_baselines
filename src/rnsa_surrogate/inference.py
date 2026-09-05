@@ -190,6 +190,7 @@ def sliding_window_predict(
         sphere_threshold=sphere_threshold,
         sphere_support_threshold=sphere_support_threshold,
         sphere_score_weight=sphere_score_weight,
+        return_vessel_segmentation=return_vessel_segmentation,
     )
 
 
@@ -215,6 +216,7 @@ def ensemble_sliding_window_predict(
     sphere_threshold: float = 0.5,
     sphere_support_threshold: float = 0.2,
     sphere_score_weight: float = 0.0,
+    return_vessel_segmentation: bool = False,
 ) -> tuple[np.ndarray, list[int], dict[str, np.ndarray]]:
     """Soft-vote fold probabilities, optionally with left-right flip TTA.
 
