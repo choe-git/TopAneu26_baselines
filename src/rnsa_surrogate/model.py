@@ -122,6 +122,7 @@ class RNSASurrogate(nn.Module):
         location_transformer_layers: int = 0,
         location_transformer_heads: int = 4,
         dual_decoder: bool = False,
+        component_location_head: bool = False,
     ) -> None:
         super().__init__()
         if levels < 3:
@@ -173,6 +174,14 @@ class RNSASurrogate(nn.Module):
         else:
             self.location_presence = nn.Linear(channels[-1], location_classes)
         self.aneurysm_presence = nn.Linear(channels[-1], 1)
+        self.component_location = (
+            nn.Sequential(
+                nn.LayerNorm(channels[-1]),
+                nn.Linear(channels[-1], location_classes + 1),
+            )
+            if component_location_head
+            else None
+        )
 
     def forward(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
         encoded = self.encoder(inputs)
@@ -213,13 +222,21 @@ class RNSASurrogate(nn.Module):
         else:
             location_presence_logits = self.location_presence(pooled)
 
-        return {
+        outputs = {
             "aneurysm_logits": aneurysm_logits,
             "location_logits": location_logits,
             "vessel_logits": vessel_logits,
             "location_presence_logits": location_presence_logits,
             "aneurysm_presence_logits": self.aneurysm_presence(pooled),
         }
+        if self.component_location is not None:
+            lesion_features = weighted_pool(
+                bottleneck, torch.sigmoid(aneurysm_logits.float())
+            )
+            outputs["component_location_logits"] = self.component_location(
+                lesion_features
+            )
+        return outputs
 
 
 class VesselPretrainUNet(nn.Module):

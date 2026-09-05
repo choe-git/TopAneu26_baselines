@@ -349,6 +349,9 @@ def run_official_validation(
                 settings.get("minimum_component_voxels", 5)
             ),
             maximum_components=int(settings.get("maximum_components", 5)),
+            component_location_weight=float(
+                settings.get("component_location_weight", 0.0)
+            ),
         )
         ground_truth, _ = load_zyx(
             location_mask_root / f"{case['case_id']}.nii.gz"
@@ -401,6 +404,9 @@ def run_official_validation(
                 settings.get("minimum_component_voxels", 5)
             ),
             "maximum_components": int(settings.get("maximum_components", 5)),
+            "component_location_weight": float(
+                settings.get("component_location_weight", 0.0)
+            ),
         },
     }
 

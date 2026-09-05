@@ -349,6 +349,7 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
                 ]
             )
             center_zyx = tuple((center + jitter).tolist())
+            component_location = int(component["class_id"])
         else:
             use_vessel = (
                 self.vessel_cases and rng.random() < self.vessel_negative_fraction
@@ -365,6 +366,7 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
                 )
             else:
                 center_zyx = self._random_center(tuple(case["shape_zyx"]), rng)
+            component_location = 0
 
         image, location, vessel = _load_cached_case(
             self.cache_root, str(case["cache_dir"])
@@ -399,16 +401,6 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
             if rng.random() < 0.20:
                 gamma = float(rng.uniform(0.8, 1.2))
                 inputs[0] = np.sign(inputs[0]) * np.abs(inputs[0]) ** gamma
-            if rng.random() < 0.05:
-                inputs[0] *= -1.0
-            for spatial_axis, coordinate_channel in ((-3, 2), (-2, 3)):
-                if rng.random() < 0.15:
-                    inputs = np.flip(inputs, axis=spatial_axis).copy()
-                    inputs[coordinate_channel] *= -1.0
-                    location_patch = np.flip(
-                        location_patch, axis=spatial_axis
-                    ).copy()
-                    vessel_patch = np.flip(vessel_patch, axis=spatial_axis).copy()
             if rng.random() < 0.5:
                 inputs = np.flip(inputs, axis=-1).copy()
                 inputs[4] *= -1.0
@@ -416,12 +408,16 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
                     np.flip(location_patch, axis=-1)
                 ].copy()
                 vessel_patch = self.vessel_swap[np.flip(vessel_patch, axis=-1)].copy()
+                component_location = int(self.location_swap[component_location])
 
         presence = np.zeros(52, dtype=np.float32)
         foreground_labels = np.unique(location_patch)
         foreground_labels = foreground_labels[
             (foreground_labels >= 1) & (foreground_labels <= 52)
         ]
+        if component_location == 0 and foreground_labels.size:
+            component_counts = np.bincount(location_patch.reshape(-1), minlength=53)
+            component_location = int(np.argmax(component_counts[1:53]) + 1)
         presence[foreground_labels - 1] = 1.0
         return {
             "image": torch.from_numpy(inputs.astype(np.float32, copy=False)),
@@ -430,4 +426,5 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
             "vessel_valid": torch.tensor(float(case.get("vessel_valid", True))),
             "location_presence": torch.from_numpy(presence),
             "aneurysm_presence": torch.tensor(float(foreground_labels.size > 0)),
+            "component_location": torch.tensor(component_location, dtype=torch.long),
         }

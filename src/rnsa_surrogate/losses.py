@@ -324,6 +324,29 @@ def multitask_loss(
         outputs["aneurysm_presence_logits"].flatten(),
         batch["aneurysm_presence"].float(),
     )
+    component_location = zero
+    if "component_location_logits" in outputs:
+        component_target = batch["component_location"].long()
+        component_values = F.cross_entropy(
+            outputs["component_location_logits"],
+            component_target,
+            reduction="none",
+            label_smoothing=float(
+                weights.get("component_location_label_smoothing", 0.05)
+            ),
+        )
+        component_weights = torch.where(
+            component_target > 0,
+            torch.ones_like(component_values),
+            torch.full_like(
+                component_values,
+                float(weights.get("component_location_negative_weight", 0.25)),
+            ),
+        )
+        component_location = (
+            (component_values * component_weights).sum()
+            / component_weights.sum().clamp_min(1.0)
+        )
 
     total = (
         weights.get("aneurysm", 1.0) * binary
@@ -343,6 +366,7 @@ def multitask_loss(
         + presence_territory_weight * territory_location_presence
         + presence_side_weight * side_location_presence
         + weights.get("aneurysm_presence", 0.05) * presence
+        + weights.get("component_location", 0.0) * component_location
     )
     values: dict[str, Any] = {
         "aneurysm": binary,
@@ -354,6 +378,7 @@ def multitask_loss(
         "location_presence_territory": territory_location_presence,
         "location_presence_side": side_location_presence,
         "aneurysm_presence": presence,
+        "component_location": component_location,
         "total": total,
     }
     return total, {name: float(value.detach()) for name, value in values.items()}

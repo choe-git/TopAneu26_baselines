@@ -1,0 +1,74 @@
+experiment:
+  name: rnsa_surrogate_component_location
+  seed: 2026
+data:
+  target_spacing_zyx: [0.60, 0.60, 0.60]
+  patch_size: [64, 96, 96]
+  positive_fraction: 0.75
+  vessel_negative_fraction: 0.50
+  train_samples: 800
+  val_samples: 160
+  test_samples: 160
+  num_workers: 4
+  prefetch_factor: 1
+  test_num_workers: 0
+model:
+  in_channels: 5
+  base_channels: 16
+  levels: 4
+  vessel_classes: 37
+  location_classes: 52
+  location_transformer_layers: 2
+  location_transformer_heads: 4
+  dual_decoder: true
+  component_location_head: true
+vessel_pretrain:
+  epochs: 1000
+  train_samples: 1200
+  val_samples: 160
+  vessel_fraction: 0.90
+  learning_rate: 0.0001
+  warmup_epochs: 3
+ensemble:
+  n_folds: 5
+  fold_epochs: 40
+  tta_left_right: false
+train:
+  epochs: 40
+  batch_size: 1
+  accumulate_steps: 8
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  warmup_epochs: 4
+  amp: bf16
+  grad_clip: 12.0
+  ema_decay: 0.999
+  validate_every: 10
+  test_every: 0
+  device: cuda
+validation:
+  selection_task: task2
+  overlap: 0.5
+  mask_threshold: 0.25
+  class_threshold: 0.15
+  presence_threshold: 0.25
+  presence_top_k: 3
+  presence_evidence_voxels: 64
+  minimum_component_voxels: 5
+  maximum_components: 5
+  component_location_weight: 1.0
+loss:
+  aneurysm: 1.0
+  aneurysm_positive_weight: 10.0
+  location_exact: 0.50
+  location_territory: 0.0
+  location_side: 0.0
+  vessel: 0.1
+  location_presence_exact: 0.10
+  location_presence_positive_weight: 4.0
+  location_presence_territory: 0.0
+  location_presence_side: 0.0
+  aneurysm_presence: 0.10
+  component_location: 0.50
+  component_location_negative_weight: 0.25
+  component_location_label_smoothing: 0.05

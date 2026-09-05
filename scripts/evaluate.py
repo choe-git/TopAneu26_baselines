@@ -91,6 +91,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-component-voxels", type=int, default=5)
     parser.add_argument("--maximum-components", type=int, default=5)
     parser.add_argument(
+        "--component-location-weight",
+        type=float,
+        default=0.0,
+        help="Fuse categorical patch-head votes into component location labels",
+    )
+    parser.add_argument(
         "--save-predictions", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--overwrite", action="store_true")
@@ -297,6 +303,7 @@ def main() -> None:
                 presence_evidence_voxels=args.presence_evidence_voxels,
                 minimum_component_voxels=args.minimum_component_voxels,
                 maximum_components=args.maximum_components,
+                component_location_weight=args.component_location_weight,
                 tta_left_right=args.tta_left_right,
                 location_lr_swap=cache_index["location_lr_swap"],
             )
@@ -401,6 +408,7 @@ def main() -> None:
             "presence_evidence_voxels": args.presence_evidence_voxels,
             "minimum_component_voxels": args.minimum_component_voxels,
             "maximum_components": args.maximum_components,
+            "component_location_weight": args.component_location_weight,
         },
         "inference": {
             "soft_voting_folds": args.ensemble_folds,

@@ -49,6 +49,9 @@ def _component_postprocess(
     presence_threshold: float,
     minimum_component_voxels: int,
     maximum_components: int,
+    patch_class: np.ndarray | None = None,
+    patch_class_confidence: np.ndarray | None = None,
+    component_location_weight: float = 0.0,
 ) -> tuple[np.ndarray, list[int], np.ndarray]:
     """Keep strong binary candidates and assign one location per component."""
     candidate_mask = binary_probability >= mask_threshold
@@ -74,6 +77,23 @@ def _component_postprocess(
         class_votes = np.bincount(
             voxel_class[region][component], weights=vote_weights, minlength=53
         )
+        if (
+            patch_class is not None
+            and patch_class_confidence is not None
+            and component_location_weight > 0
+        ):
+            patch_votes = np.bincount(
+                patch_class[region][component],
+                weights=(
+                    binary_values
+                    * np.maximum(patch_class_confidence[region][component], 1e-3)
+                ),
+                minlength=53,
+            )
+            patch_votes[0] = 0.0
+            if patch_votes.sum() > 0:
+                patch_votes *= class_votes[1:].sum() / max(patch_votes.sum(), 1e-8)
+                class_votes += component_location_weight * patch_votes
         class_id = int(np.argmax(class_votes[1:]) + 1)
         location_confidence = float(
             class_votes[class_id] / max(class_votes[1:].sum(), 1e-8)
@@ -125,6 +145,7 @@ def sliding_window_predict(
     presence_evidence_voxels: int = 64,
     minimum_component_voxels: int = 5,
     maximum_components: int = 5,
+    component_location_weight: float = 0.0,
 ) -> tuple[np.ndarray, list[int], dict[str, np.ndarray]]:
     return ensemble_sliding_window_predict(
         [model],
@@ -141,6 +162,7 @@ def sliding_window_predict(
         presence_evidence_voxels=presence_evidence_voxels,
         minimum_component_voxels=minimum_component_voxels,
         maximum_components=maximum_components,
+        component_location_weight=component_location_weight,
     )
 
 
@@ -160,6 +182,7 @@ def ensemble_sliding_window_predict(
     presence_evidence_voxels: int = 64,
     minimum_component_voxels: int = 5,
     maximum_components: int = 5,
+    component_location_weight: float = 0.0,
     tta_left_right: bool = False,
     location_lr_swap: Sequence[int] | None = None,
 ) -> tuple[np.ndarray, list[int], dict[str, np.ndarray]]:
@@ -188,6 +211,8 @@ def ensemble_sliding_window_predict(
     binary_count = np.zeros(image.shape, dtype=np.uint16)
     class_vote_margin = np.zeros(image.shape, dtype=np.float32)
     best_class = np.zeros(image.shape, dtype=np.uint8)
+    patch_best_class = np.zeros(image.shape, dtype=np.uint8)
+    patch_class_margin = np.zeros(image.shape, dtype=np.float32)
     global_patch_scores: list[np.ndarray] = []
     aneurysm_patch_scores: list[float] = []
     modality_value = 1.0 if modality.lower() == "mr" else -1.0
@@ -228,6 +253,7 @@ def ensemble_sliding_window_predict(
                 location_probability_patch = None
                 global_probability_patch = None
                 aneurysm_probability_patch = None
+                component_location_probability_patch = None
                 for model in models:
                     for flipped in tta_variants:
                         member_input = tensor
@@ -252,6 +278,11 @@ def ensemble_sliding_window_predict(
                         member_aneurysm = torch.sigmoid(
                             outputs["aneurysm_presence_logits"]
                         )[0, 0].float()
+                        member_component_location = None
+                        if "component_location_logits" in outputs:
+                            member_component_location = torch.softmax(
+                                outputs["component_location_logits"][:, 1:53], dim=1
+                            )[0].float()
                         if flipped:
                             assert location_restore is not None
                             member_binary = torch.flip(member_binary, dims=(-1,))
@@ -259,16 +290,28 @@ def ensemble_sliding_window_predict(
                                 member_location, dims=(-1,)
                             )[location_restore]
                             member_global = member_global[location_restore]
+                            if member_component_location is not None:
+                                member_component_location = member_component_location[
+                                    location_restore
+                                ]
                         if binary_probability_patch is None:
                             binary_probability_patch = member_binary
                             location_probability_patch = member_location
                             global_probability_patch = member_global
                             aneurysm_probability_patch = member_aneurysm
+                            component_location_probability_patch = (
+                                member_component_location
+                            )
                         else:
                             binary_probability_patch += member_binary
                             location_probability_patch += member_location
                             global_probability_patch += member_global
                             aneurysm_probability_patch += member_aneurysm
+                            if member_component_location is not None:
+                                assert component_location_probability_patch is not None
+                                component_location_probability_patch += (
+                                    member_component_location
+                                )
                 assert binary_probability_patch is not None
                 assert location_probability_patch is not None
                 assert global_probability_patch is not None
@@ -277,6 +320,8 @@ def ensemble_sliding_window_predict(
                 location_probability_patch /= members
                 global_probability_patch /= members
                 aneurysm_probability_patch /= members
+                if component_location_probability_patch is not None:
+                    component_location_probability_patch /= members
                 binary = binary_probability_patch.cpu().numpy()
                 global_probability = global_probability_patch
                 evidence_voxels = min(presence_evidence_voxels, binary.size)
@@ -291,6 +336,25 @@ def ensemble_sliding_window_predict(
                     global_probability.cpu().numpy() * patch_gate
                 )
                 aneurysm_patch_scores.append(aneurysm_probability)
+                if component_location_probability_patch is not None:
+                    component_score, component_index = (
+                        component_location_probability_patch.max(dim=0)
+                    )
+                    component_score_value = float(component_score.item()) * patch_gate
+                    component_class_value = int(component_index.item()) + 1
+                    current_patch_class = patch_best_class[region]
+                    current_patch_margin = patch_class_margin[region]
+                    empty_patch = current_patch_class == 0
+                    same_patch = empty_patch | (
+                        current_patch_class == component_class_value
+                    )
+                    current_patch_class[empty_patch] = component_class_value
+                    current_patch_margin[same_patch] += component_score_value
+                    different_patch = ~same_patch
+                    current_patch_margin[different_patch] -= component_score_value
+                    switch_patch = different_patch & (current_patch_margin < 0)
+                    current_patch_class[switch_patch] = component_class_value
+                    current_patch_margin[switch_patch] *= -1.0
                 location = location_probability_patch * (
                     0.5 + 0.5 * global_probability[:, None, None, None]
                 )
@@ -325,6 +389,8 @@ def ensemble_sliding_window_predict(
     binary_probability = binary_probability[crop]
     class_confidence = class_confidence[crop]
     best_class = best_class[crop]
+    patch_best_class = patch_best_class[crop]
+    patch_class_margin = patch_class_margin[crop] / np.maximum(binary_count[crop], 1)
     segmentation, task1, component_location_scores = _component_postprocess(
         binary_probability,
         best_class,
@@ -333,6 +399,9 @@ def ensemble_sliding_window_predict(
         presence_threshold,
         minimum_component_voxels,
         maximum_components,
+        patch_best_class,
+        patch_class_margin,
+        component_location_weight,
     )
     diagnostics = {
         "binary_probability": binary_probability,
@@ -346,5 +415,8 @@ def ensemble_sliding_window_predict(
             minimum_component_voxels, dtype=np.int64
         ),
         "maximum_components": np.asarray(maximum_components, dtype=np.int64),
+        "component_location_weight": np.asarray(
+            component_location_weight, dtype=np.float32
+        ),
     }
     return segmentation, task1, diagnostics
