@@ -177,6 +177,7 @@ def evaluate_pair(
     support_radius: int,
     use_refined_location: bool,
     full: bool,
+    truth_cache: dict[str, np.ndarray],
     save_root: Path | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     task1_counts, task2_counts, task2_segmentations = [], [], []
@@ -189,8 +190,10 @@ def evaluate_pair(
             objectness_threshold, mask_threshold, support_radius,
             use_refined_location
         )
-        truth, _ = load_zyx(source_root / "location_masks" / f"{case_id}.nii.gz")
-        truth = np.asarray(truth, dtype=np.uint8)
+        if case_id not in truth_cache:
+            truth, _ = load_zyx(source_root / "location_masks" / f"{case_id}.nii.gz")
+            truth_cache[case_id] = np.asarray(truth, dtype=np.uint8)
+        truth = truth_cache[case_id]
         native_prediction = resize_to_shape(cache_prediction, truth.shape, order=0).astype(np.uint8)
         task1_counts.append(task1_case_counts(case["json_locations"], locations))
         if full:
@@ -200,14 +203,15 @@ def evaluate_pair(
             segmentation = np.zeros((52, 3), dtype=np.float64)
         task2_counts.append(counts)
         task2_segmentations.append(segmentation)
-        truth_binary, prediction_binary = truth > 0, native_prediction > 0
-        binary_total += (
-            int(np.count_nonzero(truth_binary & prediction_binary)),
-            int(np.count_nonzero(~truth_binary & prediction_binary)),
-            int(np.count_nonzero(truth_binary & ~prediction_binary)),
-            int(np.count_nonzero(~truth_binary & ~prediction_binary)),
-        )
-        component_total += component_counts(truth_binary, prediction_binary)
+        if full:
+            truth_binary, prediction_binary = truth > 0, native_prediction > 0
+            binary_total += (
+                int(np.count_nonzero(truth_binary & prediction_binary)),
+                int(np.count_nonzero(~truth_binary & prediction_binary)),
+                int(np.count_nonzero(truth_binary & ~prediction_binary)),
+                int(np.count_nonzero(~truth_binary & ~prediction_binary)),
+            )
+            component_total += component_counts(truth_binary, prediction_binary)
         per_case.append({
             "case_id": case_id, "oof_fold": fold,
             "task1_truth": case["json_locations"], "task1_prediction": locations,
@@ -290,12 +294,14 @@ def main() -> None:
     )
     source_root = Path(cache_index["source_root"]).resolve()
     sweep = []
+    truth_cache: dict[str, np.ndarray] = {}
     for objectness_threshold in sorted(set(args.objectness_thresholds)):
         for mask_threshold in sorted(set(args.mask_thresholds)):
             metrics, _ = evaluate_pair(
                 case_ids, cases, folds, records_by_case, predictions, roi_sizes,
                 source_root, objectness_threshold, mask_threshold,
-                args.support_radius_voxels, args.use_refined_location, False
+                args.support_radius_voxels, args.use_refined_location, False,
+                truth_cache,
             )
             sweep.append(metrics)
     best = max(sweep, key=lambda item: (item["detection_proxy"], -abs(item["objectness_threshold"] - 0.35), -abs(item["mask_threshold"] - 0.35)))
@@ -303,6 +309,7 @@ def main() -> None:
         case_ids, cases, folds, records_by_case, predictions, roi_sizes, source_root,
         float(best["objectness_threshold"]), float(best["mask_threshold"]),
         args.support_radius_voxels, args.use_refined_location, True,
+        truth_cache,
         output if args.save_predictions else None,
     )
     output.mkdir(parents=True, exist_ok=True)
