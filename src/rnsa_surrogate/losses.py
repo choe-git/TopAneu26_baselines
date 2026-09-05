@@ -180,7 +180,9 @@ def soft_dice_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)).mean()
 
 
-def focal_tversky_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def focal_tversky_loss(
+    logits: torch.Tensor, target: torch.Tensor, gamma: float = 1.0
+) -> torch.Tensor:
     probability = torch.sigmoid(logits.float())
     target = target.float()
     axes = tuple(range(2, logits.ndim))
@@ -190,7 +192,7 @@ def focal_tversky_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tens
     score = (true_positive + 1.0) / (
         true_positive + 0.3 * false_positive + 0.7 * false_negative + 1.0
     )
-    return (1.0 - score).mean()
+    return (1.0 - score).pow(gamma).mean()
 
 
 def asymmetric_multilabel_loss(
@@ -348,6 +350,24 @@ def multitask_loss(
             / component_weights.sum().clamp_min(1.0)
         )
 
+    sphere = zero
+    has_sphere_output = "sphere_logits" in outputs
+    has_sphere_target = "aneurysm_sphere" in batch
+    if has_sphere_output != has_sphere_target:
+        raise ValueError("sphere output and target must either both be present or absent")
+    if has_sphere_output:
+        sphere_target = batch["aneurysm_sphere"].float()[:, None]
+        sphere = _positive_weighted_bce(
+            outputs["sphere_logits"],
+            sphere_target,
+            positive_weight=float(weights.get("sphere_positive_weight", 10.0)),
+        )
+        sphere += focal_tversky_loss(
+            outputs["sphere_logits"],
+            sphere_target,
+            gamma=float(weights.get("sphere_focal_gamma", 4.0 / 3.0)),
+        )
+
     total = (
         weights.get("aneurysm", 1.0) * binary
         + _hierarchy_weight(weights, "location_exact", 0.25, "location_seg", 0.50)
@@ -367,6 +387,7 @@ def multitask_loss(
         + presence_side_weight * side_location_presence
         + weights.get("aneurysm_presence", 0.05) * presence
         + weights.get("component_location", 0.0) * component_location
+        + weights.get("sphere", 0.0) * sphere
     )
     values: dict[str, Any] = {
         "aneurysm": binary,
@@ -379,6 +400,7 @@ def multitask_loss(
         "location_presence_side": side_location_presence,
         "aneurysm_presence": presence,
         "component_location": component_location,
+        "sphere": sphere,
         "total": total,
     }
     return total, {name: float(value.detach()) for name, value in values.items()}

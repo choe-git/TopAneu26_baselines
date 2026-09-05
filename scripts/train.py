@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
 
 def training_contract(config: dict[str, Any]) -> dict[str, Any]:
     train = config["train"]
-    return {
+    contract = {
         "model": config["model"],
         "loss": config["loss"],
         "data": {
@@ -135,6 +135,9 @@ def training_contract(config: dict[str, Any]) -> dict[str, Any]:
             )
         },
     }
+    if "sphere_radius_mm" in config["data"]:
+        contract["data"]["sphere_radius_mm"] = config["data"]["sphere_radius_mm"]
+    return contract
 
 
 def make_dataset(
@@ -157,6 +160,11 @@ def make_dataset(
         augment=augment,
         seed=seed,
         case_ids=case_ids,
+        sphere_radius_mm=(
+            float(data.get("sphere_radius_mm", 3.0))
+            if config.get("model", {}).get("sphere_head", False)
+            else None
+        ),
     )
 
 
@@ -640,7 +648,13 @@ def main() -> None:
         source_state = dict(source_checkpoint["model"])
         if "ema" in source_checkpoint:
             source_state.update(source_checkpoint["ema"]["shadow"])
-        model.load_state_dict(source_state, strict=True)
+        incompatible = model.load_state_dict(source_state, strict=False)
+        allowed_missing = {name for name in model.state_dict() if name.startswith("sphere_head.")}
+        if set(incompatible.missing_keys) != allowed_missing or incompatible.unexpected_keys:
+            raise ValueError(
+                "Initialization checkpoint is architecture-incompatible: "
+                f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+            )
         atomic_json_dump(
             {
                 "checkpoint": str(initialize_path),
@@ -650,6 +664,7 @@ def main() -> None:
                 "source_epoch": source_checkpoint.get("epoch"),
                 "weights": "ema" if "ema" in source_checkpoint else "model",
                 "optimizer_reset": True,
+                "randomly_initialized": sorted(allowed_missing),
             },
             model_dir / "initialization.json",
         )

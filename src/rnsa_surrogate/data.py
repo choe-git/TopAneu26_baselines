@@ -89,6 +89,40 @@ def coordinate_patch(
     return np.stack([z, y, x])
 
 
+def center_sphere_target(
+    patch_size: tuple[int, int, int],
+    start_zyx: tuple[int, int, int],
+    components: Collection[dict[str, object]],
+    spacing_zyx: tuple[float, float, float],
+    radius_mm: float,
+) -> np.ndarray:
+    """Rasterize physical-radius spheres around cached lesion component centers."""
+    if radius_mm <= 0:
+        raise ValueError("sphere radius must be positive")
+    target = np.zeros(patch_size, dtype=np.float32)
+    spacing = np.asarray(spacing_zyx, dtype=np.float64)
+    patch_start = np.asarray(start_zyx, dtype=np.int64)
+    patch_shape = np.asarray(patch_size, dtype=np.int64)
+    radii = np.ceil(radius_mm / spacing).astype(np.int64)
+    for component in components:
+        center = np.asarray(component["center_zyx"], dtype=np.int64) - patch_start
+        lower = np.maximum(center - radii, 0)
+        upper = np.minimum(center + radii + 1, patch_shape)
+        if np.any(lower >= upper):
+            continue
+        axes = [
+            (np.arange(lo, hi, dtype=np.float64) - coordinate) * axis_spacing
+            for lo, hi, coordinate, axis_spacing in zip(
+                lower, upper, center, spacing, strict=True
+            )
+        ]
+        z, y, x = np.meshgrid(*axes, indexing="ij")
+        sphere = z * z + y * y + x * x <= radius_mm * radius_mm + 1e-8
+        slices = tuple(slice(int(lo), int(hi)) for lo, hi in zip(lower, upper))
+        target[slices] = np.maximum(target[slices], sphere.astype(np.float32))
+    return target
+
+
 def _normalize(image: np.ndarray) -> np.ndarray:
     finite = image[np.isfinite(image)]
     if finite.size == 0:
@@ -266,6 +300,7 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
         augment: bool = False,
         seed: int = 2026,
         case_ids: Collection[str] | None = None,
+        sphere_radius_mm: float | None = None,
     ) -> None:
         index = load_cache_index(cache_dir)
         self.cache_root = str(Path(index["index_path"]).parent)
@@ -290,6 +325,10 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
         self.seed = int(seed)
         self.location_swap = np.asarray(index["location_lr_swap"], dtype=np.int64)
         self.vessel_swap = np.asarray(index["vessel_lr_swap"], dtype=np.int64)
+        self.spacing_zyx = tuple(float(value) for value in index["target_spacing_zyx"])
+        self.sphere_radius_mm = (
+            float(sphere_radius_mm) if sphere_radius_mm is not None else None
+        )
         self.instances = [
             (case, component)
             for case in self.cases
@@ -376,6 +415,17 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
         )
         location_patch, _ = extract_patch(location, center_zyx, self.patch_size)
         vessel_patch, _ = extract_patch(vessel, center_zyx, self.patch_size)
+        sphere_patch = (
+            center_sphere_target(
+                self.patch_size,
+                start,
+                case.get("components", []),
+                self.spacing_zyx,
+                self.sphere_radius_mm,
+            )
+            if self.sphere_radius_mm is not None
+            else None
+        )
         coordinates = coordinate_patch(start, self.patch_size, tuple(case["shape_zyx"]))
         modality_value = 1.0 if case["modality"] == "mr" else -1.0
         modality = np.full((1, *self.patch_size), modality_value, dtype=np.float32)
@@ -408,6 +458,8 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
                     np.flip(location_patch, axis=-1)
                 ].copy()
                 vessel_patch = self.vessel_swap[np.flip(vessel_patch, axis=-1)].copy()
+                if sphere_patch is not None:
+                    sphere_patch = np.flip(sphere_patch, axis=-1).copy()
                 component_location = int(self.location_swap[component_location])
 
         presence = np.zeros(52, dtype=np.float32)
@@ -419,7 +471,7 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
             component_counts = np.bincount(location_patch.reshape(-1), minlength=53)
             component_location = int(np.argmax(component_counts[1:53]) + 1)
         presence[foreground_labels - 1] = 1.0
-        return {
+        sample = {
             "image": torch.from_numpy(inputs.astype(np.float32, copy=False)),
             "location": torch.from_numpy(location_patch.astype(np.int64, copy=False)),
             "vessel": torch.from_numpy(vessel_patch.astype(np.int64, copy=False)),
@@ -428,3 +480,6 @@ class CachedTopAneuPatchDataset(Dataset[dict[str, torch.Tensor]]):
             "aneurysm_presence": torch.tensor(float(foreground_labels.size > 0)),
             "component_location": torch.tensor(component_location, dtype=torch.long),
         }
+        if sphere_patch is not None:
+            sample["aneurysm_sphere"] = torch.from_numpy(sphere_patch)
+        return sample

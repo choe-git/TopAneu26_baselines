@@ -123,6 +123,7 @@ class RNSASurrogate(nn.Module):
         location_transformer_heads: int = 4,
         dual_decoder: bool = False,
         component_location_head: bool = False,
+        sphere_head: bool = False,
     ) -> None:
         super().__init__()
         if levels < 3:
@@ -135,6 +136,7 @@ class RNSASurrogate(nn.Module):
         self.decoder = Decoder(channels)
         self.aneurysm_decoder = Decoder(channels) if dual_decoder else None
         self.aneurysm_head = nn.Conv3d(channels[0], 1, 1)
+        self.sphere_head = nn.Conv3d(channels[0], 1, 1) if sphere_head else None
         self.location_head = nn.Conv3d(channels[0], location_classes + 1, 1)
         self.vessel_head = nn.Conv3d(channels[1], vessel_classes, 1)
         pooled_channels = channels[-1] * 3
@@ -236,6 +238,8 @@ class RNSASurrogate(nn.Module):
             outputs["component_location_logits"] = self.component_location(
                 lesion_features
             )
+        if self.sphere_head is not None:
+            outputs["sphere_logits"] = self.sphere_head(full)
         return outputs
 
 
