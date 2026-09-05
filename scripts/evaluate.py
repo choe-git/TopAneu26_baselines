@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from scipy.ndimage import label as connected_components
 from tqdm import tqdm
 
 from rnsa_surrogate.cache import (
@@ -49,6 +50,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         help="Soft-vote RUN_DIR/baseline/folds/fold_N/checkpoint_best.pth",
+    )
+    parser.add_argument(
+        "--oof",
+        action="store_true",
+        help=(
+            "Evaluate each non-test case with only its held-out fold model. "
+            "Requires --ensemble-folds and never soft-votes across folds."
+        ),
     )
     parser.add_argument(
         "--tta-left-right",
@@ -107,6 +116,41 @@ def binary_metrics(tp: int, fp: int, fn: int, tn: int) -> dict[str, float | int]
     }
 
 
+def component_objectness(
+    truth_binary: np.ndarray, prediction_binary: np.ndarray
+) -> dict[str, float | int]:
+    """Measure lesion discovery without requiring the correct location class."""
+    structure = np.ones((3, 3, 3), dtype=np.uint8)
+    truth_components, truth_count = connected_components(
+        truth_binary, structure=structure
+    )
+    prediction_components, prediction_count = connected_components(
+        prediction_binary, structure=structure
+    )
+    detected_truth = {
+        int(value)
+        for value in np.unique(truth_components[prediction_binary])
+        if value
+    }
+    overlapping_predictions = {
+        int(value)
+        for value in np.unique(prediction_components[truth_binary])
+        if value
+    }
+    return {
+        "ground_truth_components": int(truth_count),
+        "predicted_components": int(prediction_count),
+        "detected_ground_truth_components": len(detected_truth),
+        "false_negative_ground_truth_components": int(truth_count)
+        - len(detected_truth),
+        "overlapping_prediction_components": len(overlapping_predictions),
+        "false_positive_prediction_components": int(prediction_count)
+        - len(overlapping_predictions),
+        "sensitivity": safe_divide(len(detected_truth), int(truth_count)),
+        "precision": safe_divide(len(overlapping_predictions), int(prediction_count)),
+    }
+
+
 def load_model(
     checkpoint_path: Path, device: torch.device
 ) -> tuple[RNSASurrogate, dict[str, Any]]:
@@ -141,6 +185,10 @@ def main() -> None:
     layout = BaselineRunLayout.from_root(args.run_dir)
     if args.checkpoint is not None and args.ensemble_folds is not None:
         raise ValueError("Use either --checkpoint or --ensemble-folds")
+    if args.oof and args.ensemble_folds is None:
+        raise ValueError("--oof requires --ensemble-folds")
+    if args.oof and args.checkpoint is not None:
+        raise ValueError("--oof cannot be combined with --checkpoint")
     if args.ensemble_folds is not None:
         if len(set(args.ensemble_folds)) != len(args.ensemble_folds):
             raise ValueError("--ensemble-folds contains duplicates")
@@ -152,7 +200,9 @@ def main() -> None:
             ).resolve()
             for fold in args.ensemble_folds
         ]
-        default_output = layout.ensemble / "evaluation" / args.split
+        default_output = layout.ensemble / "evaluation" / (
+            "oof" if args.oof else args.split
+        )
     else:
         checkpoint_paths = [(args.checkpoint or layout.checkpoint).resolve()]
         default_output = layout.baseline / "evaluation" / args.split
@@ -186,9 +236,27 @@ def main() -> None:
         amp_dtype = None
 
     cache_index = load_cache_index(resolve_cache(layout))
-    cases = [case for case in cache_index["cases"] if case["split"] == args.split]
+    fold_to_model: dict[int, RNSASurrogate] = {}
+    case_to_fold: dict[str, int] = {}
+    if args.oof:
+        fold_manifest = json.loads(layout.fold_manifest.read_text(encoding="utf-8"))
+        case_to_fold = {
+            str(case_id): int(fold)
+            for case_id, fold in fold_manifest["case_to_fold"].items()
+        }
+        assert args.ensemble_folds is not None
+        fold_to_model = dict(zip(args.ensemble_folds, models, strict=True))
+        cases = [
+            case
+            for case in cache_index["cases"]
+            if case_to_fold.get(str(case["case_id"])) in fold_to_model
+        ]
+        evaluation_split = "oof"
+    else:
+        cases = [case for case in cache_index["cases"] if case["split"] == args.split]
+        evaluation_split = args.split
     if not cases:
-        raise ValueError(f"Cache contains no {args.split!r} cases")
+        raise ValueError(f"Cache contains no {evaluation_split!r} cases")
     cache_root = Path(cache_index["index_path"]).parent
     source_root = (args.source or Path(cache_index["source_root"])).resolve()
     location_mask_root = source_root / "location_masks"
@@ -204,15 +272,18 @@ def main() -> None:
     task2_counts_per_case = []
     task2_segmentation_per_case = []
     binary_totals = np.zeros(4, dtype=np.int64)
+    component_totals = np.zeros(4, dtype=np.int64)
     per_case = []
 
-    for case in tqdm(cases, desc=f"Evaluating {args.split}"):
+    for case in tqdm(cases, desc=f"Evaluating {evaluation_split}"):
         case_id = case["case_id"]
+        case_fold = case_to_fold.get(str(case_id)) if args.oof else None
+        case_models = [fold_to_model[case_fold]] if case_fold is not None else models
         case_dir = cache_root / case["cache_dir"]
         image = np.load(case_dir / "image.npy", mmap_mode="r").astype(np.float32)
         cache_prediction, predicted_locations, inference_diagnostics = (
             ensemble_sliding_window_predict(
-                models,
+                case_models,
                 image,
                 case["modality"],
                 config["data"]["patch_size"],
@@ -258,9 +329,18 @@ def main() -> None:
         fn = int(np.count_nonzero(truth_binary & ~prediction_binary))
         tn = int(np.count_nonzero(~truth_binary & ~prediction_binary))
         binary_totals += tp, fp, fn, tn
+        objectness = component_objectness(truth_binary, prediction_binary)
+        component_totals += (
+            objectness["ground_truth_components"],
+            objectness["predicted_components"],
+            objectness["detected_ground_truth_components"],
+            objectness["overlapping_prediction_components"],
+        )
         per_case.append(
             {
                 "case_id": case_id,
+                "oof_fold": case_fold,
+                "source_split": case["split"],
                 "modality": case["modality"],
                 "original_shape_zyx": list(ground_truth.shape),
                 "original_spacing_xyz": ground_truth_metadata["spacing_xyz"],
@@ -274,6 +354,7 @@ def main() -> None:
                     inference_diagnostics["global_aneurysm_score"]
                 ),
                 "task2_binary_diagnostic": binary_metrics(tp, fp, fn, tn),
+                "task2_component_objectness": objectness,
             }
         )
         atomic_json_dump(per_case, output_dir / "per_case_metrics.json")
@@ -285,7 +366,7 @@ def main() -> None:
             )
 
     payload = {
-        "split": args.split,
+        "split": evaluation_split,
         "cases": len(cases),
         "checkpoint": (
             str(checkpoint_paths[0]) if len(checkpoint_paths) == 1 else None
@@ -319,9 +400,17 @@ def main() -> None:
         },
         "inference": {
             "soft_voting_folds": args.ensemble_folds,
-            "models": len(models),
+            "mode": "held_out_fold_per_case" if args.oof else "ensemble",
+            "models_loaded": len(models),
+            "models_per_case": 1 if args.oof else len(models),
+            "models": 1 if args.oof else len(models),
             "left_right_tta": args.tta_left_right,
-            "probability_members": len(models) * (2 if args.tta_left_right else 1),
+            "probability_members_per_case": (
+                1 if args.oof else len(models)
+            ) * (2 if args.tta_left_right else 1),
+            "probability_members": (
+                1 if args.oof else len(models)
+            ) * (2 if args.tta_left_right else 1),
             "location_probability": "conditional softmax over classes 1..52",
             "location_overlap": "component-level weighted vote",
             "task1_aggregation": "retained aneurysm component labels",
@@ -333,7 +422,25 @@ def main() -> None:
         "diagnostics": {
             "task2_binary_voxel": binary_metrics(
                 *(int(value) for value in binary_totals)
-            )
+            ),
+            "task2_component_objectness": {
+                "ground_truth_components": int(component_totals[0]),
+                "predicted_components": int(component_totals[1]),
+                "detected_ground_truth_components": int(component_totals[2]),
+                "false_negative_ground_truth_components": int(
+                    component_totals[0] - component_totals[2]
+                ),
+                "overlapping_prediction_components": int(component_totals[3]),
+                "false_positive_prediction_components": int(
+                    component_totals[1] - component_totals[3]
+                ),
+                "sensitivity": safe_divide(
+                    int(component_totals[2]), int(component_totals[0])
+                ),
+                "precision": safe_divide(
+                    int(component_totals[3]), int(component_totals[1])
+                ),
+            },
         },
     }
     atomic_json_dump(payload, metrics_path)

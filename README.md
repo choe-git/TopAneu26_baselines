@@ -282,9 +282,30 @@ python scripts/evaluate.py \
 `--source /new/path/to/topaneu_release`로 지정합니다. 공식 macro 결과는 `metrics.json`의
 `official_task1.macro`와 `official_task2.macro`에 저장됩니다. `diagnostics.task2_binary_voxel`은
 threshold 분석을 위한 비공식 보조 지표이며 challenge ranking에는 사용되지 않습니다.
+`diagnostics.task2_component_objectness`는 location class를 무시한 lesion component sensitivity와
+false-positive component 수를 기록합니다.
 `per_case_metrics.json`에는 `task1_location_scores` 52개와
 `aneurysm_presence_score`도 저장되므로 prediction volume을 저장하지 않아도 Task 1 threshold를
 사후 분석할 수 있습니다.
+
+5-fold 모델 선택과 threshold 조정에는 test 대신 OOF 평가를 사용합니다. 각 train/val case는
+자신을 학습에서 제외한 fold checkpoint 하나로만 추론되며, 결과 구조는 일반 평가와 동일합니다.
+
+```bash
+python scripts/evaluate.py \
+  --run-dir "$RUN_DIR" \
+  --oof \
+  --ensemble-folds 0 1 2 3 4 \
+  --device cuda \
+  --no-save-predictions \
+  --overwrite
+```
+
+```text
+RUN_DIR/baseline/ensemble/evaluation/oof/
+├── metrics.json
+└── per_case_metrics.json
+```
 
 Validation 추론을 한 번 완료한 뒤 Task 1 threshold는 GPU 재추론 없이 탐색할 수 있습니다.
 
