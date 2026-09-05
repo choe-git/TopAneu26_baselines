@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--support-radius-voxels", type=int, default=5)
     parser.add_argument("--use-refined-location", action="store_true")
     parser.add_argument(
+        "--relabel-confidence-threshold",
+        type=float,
+        default=0.0,
+        help="Use the refined class only at or above this confidence",
+    )
+    parser.add_argument(
         "--fast-only",
         action="store_true",
         help="Write the cache-space detection sweep without costly surface metrics",
@@ -117,6 +123,7 @@ def paste_case(
     mask_threshold: float,
     support_radius: int,
     use_refined_location: bool,
+    relabel_confidence_threshold: float,
 ) -> tuple[np.ndarray, list[int], np.ndarray]:
     shape = tuple(int(value) for value in case["shape_zyx"])
     output = np.zeros(shape, dtype=np.uint8)
@@ -163,7 +170,9 @@ def paste_case(
         voxel_confidence = voxel_confidence[replace]
         class_id = (
             int(prediction["location_class"])
-            if use_refined_location else int(record["stage1_class"])
+            if use_refined_location
+            and float(prediction["location_confidence"]) >= relabel_confidence_threshold
+            else int(record["stage1_class"])
         )
         output[tuple(global_coordinates.T)] = class_id
         confidence[tuple(global_coordinates.T)] = voxel_confidence
@@ -234,6 +243,7 @@ def evaluate_pair(
     mask_threshold: float,
     support_radius: int,
     use_refined_location: bool,
+    relabel_confidence_threshold: float,
     full: bool,
     truth_cache: dict[str, np.ndarray],
     save_root: Path | None = None,
@@ -246,7 +256,7 @@ def evaluate_pair(
         cache_prediction, locations, touched = paste_case(
             case, records_by_case.get(case_id, []), predictions, roi_sizes[fold],
             objectness_threshold, mask_threshold, support_radius,
-            use_refined_location
+            use_refined_location, relabel_confidence_threshold
         )
         task1_counts.append(task1_case_counts(case["json_locations"], locations))
         if full:
@@ -371,6 +381,7 @@ def main() -> None:
                 source_root, Path(cache_index["index_path"]).parent,
                 objectness_threshold, mask_threshold,
                 args.support_radius_voxels, args.use_refined_location, False,
+                args.relabel_confidence_threshold,
                 truth_cache,
             )
             sweep.append(metrics)
@@ -383,6 +394,7 @@ def main() -> None:
                 "split": "oof", "cases": len(case_ids), "folds": args.folds,
                 "mode": "stage1_oof_candidate_to_dense_roi_refiner_fast_sweep",
                 "location_policy": "refined" if args.use_refined_location else "stage1",
+                "relabel_confidence_threshold": args.relabel_confidence_threshold,
                 "best": best,
                 "note": "cache-space detection-only screening; no Dice, HD95 or VS",
             },
@@ -395,6 +407,7 @@ def main() -> None:
         Path(cache_index["index_path"]).parent,
         float(best["objectness_threshold"]), float(best["mask_threshold"]),
         args.support_radius_voxels, args.use_refined_location, True,
+        args.relabel_confidence_threshold,
         truth_cache,
         output if args.save_predictions else None,
     )
@@ -405,6 +418,7 @@ def main() -> None:
         "split": "oof", "cases": len(case_ids), "folds": args.folds,
         "mode": "stage1_oof_candidate_to_dense_roi_refiner",
         "location_policy": "refined" if args.use_refined_location else "stage1",
+        "relabel_confidence_threshold": args.relabel_confidence_threshold,
         "support_radius_voxels": args.support_radius_voxels,
         "threshold_selection": {
             "criterion": "mean task2 precision, recall, MCC on combined heldout predictions",
