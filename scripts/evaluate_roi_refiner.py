@@ -55,6 +55,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--support-radius-voxels", type=int, default=5)
     parser.add_argument("--use-refined-location", action="store_true")
+    parser.add_argument(
+        "--fast-only",
+        action="store_true",
+        help="Write the cache-space detection sweep without costly surface metrics",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--save-predictions", action=argparse.BooleanOptionalAction, default=False
@@ -370,6 +375,21 @@ def main() -> None:
             )
             sweep.append(metrics)
     best = max(sweep, key=lambda item: (item["detection_proxy"], -abs(item["objectness_threshold"] - 0.35), -abs(item["mask_threshold"] - 0.35)))
+    if args.fast_only:
+        output.mkdir(parents=True, exist_ok=True)
+        atomic_json_dump(sweep, output / "threshold_sweep.json")
+        atomic_json_dump(
+            {
+                "split": "oof", "cases": len(case_ids), "folds": args.folds,
+                "mode": "stage1_oof_candidate_to_dense_roi_refiner_fast_sweep",
+                "location_policy": "refined" if args.use_refined_location else "stage1",
+                "best": best,
+                "note": "cache-space detection-only screening; no Dice, HD95 or VS",
+            },
+            output / "fast_metrics.json",
+        )
+        print(f"ROI-refined fast OOF sweep: {output / 'fast_metrics.json'}")
+        return
     final, per_case = evaluate_pair(
         case_ids, cases, folds, records_by_case, predictions, roi_sizes, source_root,
         Path(cache_index["index_path"]).parent,
