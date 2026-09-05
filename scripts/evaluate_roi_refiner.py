@@ -380,9 +380,10 @@ def main() -> None:
                 case_ids, cases, folds, records_by_case, predictions, roi_sizes,
                 source_root, Path(cache_index["index_path"]).parent,
                 objectness_threshold, mask_threshold,
-                args.support_radius_voxels, args.use_refined_location, False,
-                args.relabel_confidence_threshold,
-                truth_cache,
+                support_radius=args.support_radius_voxels,
+                use_refined_location=args.use_refined_location,
+                relabel_confidence_threshold=args.relabel_confidence_threshold,
+                full=False, truth_cache=truth_cache,
             )
             sweep.append(metrics)
     best = max(sweep, key=lambda item: (item["detection_proxy"], -abs(item["objectness_threshold"] - 0.35), -abs(item["mask_threshold"] - 0.35)))
@@ -406,10 +407,11 @@ def main() -> None:
         case_ids, cases, folds, records_by_case, predictions, roi_sizes, source_root,
         Path(cache_index["index_path"]).parent,
         float(best["objectness_threshold"]), float(best["mask_threshold"]),
-        args.support_radius_voxels, args.use_refined_location, True,
-        args.relabel_confidence_threshold,
-        truth_cache,
-        output if args.save_predictions else None,
+        support_radius=args.support_radius_voxels,
+        use_refined_location=args.use_refined_location,
+        relabel_confidence_threshold=args.relabel_confidence_threshold,
+        full=True, truth_cache=truth_cache,
+        save_root=output if args.save_predictions else None,
     )
     output.mkdir(parents=True, exist_ok=True)
     atomic_json_dump(sweep, output / "threshold_sweep.json")
