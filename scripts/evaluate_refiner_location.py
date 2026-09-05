@@ -112,6 +112,7 @@ def evaluate_threshold(
     records_by_case: dict[str, list[dict[str, Any]]],
     predictions: dict[str, dict[str, float | int]],
     source_root: Path,
+    ground_truth_cache: dict[str, np.ndarray],
     save_root: Path | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     task1_counts_list = []
@@ -148,11 +149,15 @@ def evaluate_threshold(
             cache_prediction[tuple(coordinates.T)] = refined_class
             retained_classes.append(refined_class)
         predicted_locations = sorted(set(retained_classes))
-        ground_truth, _ = load_zyx(location_root / f"{case_id}.nii.gz")
+        if case_id not in ground_truth_cache:
+            loaded_truth, _ = load_zyx(location_root / f"{case_id}.nii.gz")
+            ground_truth_cache[case_id] = np.asarray(
+                loaded_truth, dtype=np.uint8
+            )
+        ground_truth = ground_truth_cache[case_id]
         prediction_mask = resize_to_shape(
             cache_prediction, ground_truth.shape, order=0
         ).astype(np.uint8)
-        ground_truth = np.asarray(ground_truth, dtype=np.uint8)
         task1_counts_list.append(
             task1_case_counts(case["json_locations"], predicted_locations)
         )
@@ -301,6 +306,7 @@ def main() -> None:
     cases = {str(case["case_id"]): case for case in cache_index["cases"]}
     source_root = Path(cache_index["source_root"]).resolve()
     sweep = []
+    ground_truth_cache: dict[str, np.ndarray] = {}
     for threshold in sorted(set(float(value) for value in args.thresholds)):
         metrics, _ = evaluate_threshold(
             threshold,
@@ -310,6 +316,7 @@ def main() -> None:
             records_by_case,
             scores,
             source_root,
+            ground_truth_cache,
         )
         sweep.append(metrics)
     best = max(
@@ -328,6 +335,7 @@ def main() -> None:
         records_by_case,
         scores,
         source_root,
+        ground_truth_cache,
         output if args.save_predictions else None,
     )
     output.mkdir(parents=True, exist_ok=True)
