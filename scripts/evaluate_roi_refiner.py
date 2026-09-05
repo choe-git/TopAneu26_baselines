@@ -52,6 +52,10 @@ def parse_args() -> argparse.Namespace:
         "--objectness-thresholds", type=float, nargs="+", default=[0.2, 0.35, 0.5]
     )
     parser.add_argument(
+        "--stage1-score-weight", type=float, default=0.0,
+        help="Weight of the Stage-1 candidate score in logit-space soft fusion",
+    )
+    parser.add_argument(
         "--mask-thresholds", type=float, nargs="+", default=[0.25, 0.35, 0.5]
     )
     parser.add_argument("--batch-size", type=int, default=2)
@@ -126,6 +130,7 @@ def paste_case(
     support_radius: int,
     use_refined_location: bool,
     relabel_confidence_threshold: float,
+    stage1_score_weight: float,
 ) -> tuple[np.ndarray, list[int], np.ndarray]:
     shape = tuple(int(value) for value in case["shape_zyx"])
     output = np.zeros(shape, dtype=np.uint8)
@@ -135,6 +140,17 @@ def paste_case(
     for record in records:
         prediction = predictions[str(record["candidate_id"])]
         objectness = float(prediction["objectness"])
+        if stage1_score_weight > 0:
+            epsilon = 1e-6
+            stage1_score = float(np.clip(record["stage1_score"], epsilon, 1 - epsilon))
+            refiner_score = float(np.clip(objectness, epsilon, 1 - epsilon))
+            stage1_logit = np.log(stage1_score / (1 - stage1_score))
+            refiner_logit = np.log(refiner_score / (1 - refiner_score))
+            fused_logit = (
+                stage1_score_weight * stage1_logit
+                + (1 - stage1_score_weight) * refiner_logit
+            )
+            objectness = float(1 / (1 + np.exp(-fused_logit)))
         if objectness < objectness_threshold:
             continue
         from rnsa_surrogate.refiner_candidates import candidate_coordinates
@@ -246,6 +262,7 @@ def evaluate_pair(
     support_radius: int,
     use_refined_location: bool,
     relabel_confidence_threshold: float,
+    stage1_score_weight: float,
     full: bool,
     truth_cache: dict[str, np.ndarray],
     save_root: Path | None = None,
@@ -258,7 +275,8 @@ def evaluate_pair(
         cache_prediction, locations, touched = paste_case(
             case, records_by_case.get(case_id, []), predictions, roi_sizes[fold],
             objectness_threshold, mask_threshold, support_radius,
-            use_refined_location, relabel_confidence_threshold
+            use_refined_location, relabel_confidence_threshold,
+            stage1_score_weight,
         )
         task1_counts.append(task1_case_counts(case["json_locations"], locations))
         if full:
@@ -304,6 +322,7 @@ def evaluate_pair(
     metrics = {
         "objectness_threshold": objectness_threshold,
         "mask_threshold": mask_threshold,
+        "stage1_score_weight": stage1_score_weight,
         "official_task1": task1,
         "official_task2": task2,
         "selection_scores": official_selection_scores(task1, task2),
@@ -328,6 +347,8 @@ def main() -> None:
         raise ValueError("--candidate-variant must be a simple directory name")
     if any(not 0 <= value <= 1 for value in args.objectness_thresholds + args.mask_thresholds):
         raise ValueError("Thresholds must be in [0, 1]")
+    if not 0 <= args.stage1_score_weight <= 1:
+        raise ValueError("--stage1-score-weight must be in [0, 1]")
     layout = BaselineRunLayout.from_root(args.run_dir)
     variant_root = layout.baseline / args.variant
     output = (args.output or variant_root / "oof_evaluation").resolve()
@@ -396,6 +417,7 @@ def main() -> None:
                 support_radius=args.support_radius_voxels,
                 use_refined_location=args.use_refined_location,
                 relabel_confidence_threshold=args.relabel_confidence_threshold,
+                stage1_score_weight=args.stage1_score_weight,
                 full=False, truth_cache=truth_cache,
             )
             sweep.append(metrics)
@@ -409,6 +431,7 @@ def main() -> None:
                 "mode": "stage1_oof_candidate_to_dense_roi_refiner_fast_sweep",
                 "location_policy": "refined" if args.use_refined_location else "stage1",
                 "relabel_confidence_threshold": args.relabel_confidence_threshold,
+                "stage1_score_weight": args.stage1_score_weight,
                 "best": best,
                 "note": "cache-space detection-only screening; no Dice, HD95 or VS",
             },
@@ -423,6 +446,7 @@ def main() -> None:
         support_radius=args.support_radius_voxels,
         use_refined_location=args.use_refined_location,
         relabel_confidence_threshold=args.relabel_confidence_threshold,
+        stage1_score_weight=args.stage1_score_weight,
         full=True, truth_cache=truth_cache,
         save_root=output if args.save_predictions else None,
     )
@@ -434,6 +458,7 @@ def main() -> None:
         "mode": "stage1_oof_candidate_to_dense_roi_refiner",
         "location_policy": "refined" if args.use_refined_location else "stage1",
         "relabel_confidence_threshold": args.relabel_confidence_threshold,
+        "stage1_score_weight": args.stage1_score_weight,
         "support_radius_voxels": args.support_radius_voxels,
         "threshold_selection": {
             "criterion": "mean task2 precision, recall, MCC on combined heldout predictions",
