@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum", type=float, default=0.05)
     parser.add_argument("--maximum", type=float, default=0.75)
     parser.add_argument("--steps", type=int, default=71)
+    parser.add_argument(
+        "--score-key",
+        choices=("task1_location_scores", "task1_patch_location_scores"),
+        default="task1_location_scores",
+        help="Per-case score vector to threshold",
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -42,7 +48,7 @@ def main() -> None:
     cases = json.loads(args.per_case.read_text(encoding="utf-8"))
     if not cases:
         raise ValueError("per-case metrics are empty")
-    required = {"task1_truth", "task1_location_scores"}
+    required = {"task1_truth", args.score_key}
     missing = required - set(cases[0])
     if missing:
         raise ValueError(
@@ -55,7 +61,7 @@ def main() -> None:
         counts = []
         predicted_total = 0
         for case in cases:
-            scores = np.asarray(case["task1_location_scores"], dtype=np.float64)
+            scores = np.asarray(case[args.score_key], dtype=np.float64)
             if scores.shape != (52,):
                 raise ValueError(
                     f"{case.get('case_id', '<unknown>')} has {scores.shape}, expected (52,)"
@@ -78,11 +84,17 @@ def main() -> None:
     payload = {
         "source": str(args.per_case.resolve()),
         "cases": len(cases),
+        "score_key": args.score_key,
         "objective": "mean of official Task 1 macro precision, recall, and MCC",
         "best": best,
         "sweep": results,
     }
-    output = args.output or args.per_case.with_name("presence_threshold_sweep.json")
+    default_name = (
+        "presence_threshold_sweep.json"
+        if args.score_key == "task1_location_scores"
+        else "patch_presence_threshold_sweep.json"
+    )
+    output = args.output or args.per_case.with_name(default_name)
     atomic_json_dump(payload, output)
     print(f"Best presence threshold: {best['threshold']:.4f}")
     print(f"Selection score: {best['selection_score']:.6f}")

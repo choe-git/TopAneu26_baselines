@@ -350,6 +350,10 @@ def main() -> None:
                     float(value)
                     for value in inference_diagnostics["global_location_scores"]
                 ],
+                "task1_patch_location_scores": [
+                    float(value)
+                    for value in inference_diagnostics["patch_location_scores"]
+                ],
                 "aneurysm_presence_score": float(
                     inference_diagnostics["global_aneurysm_score"]
                 ),

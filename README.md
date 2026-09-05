@@ -125,8 +125,7 @@ Kaggle RSNA 1st-place write-up의 핵심을 TopAneu의 52개 location과 37-clas
 5. test에서는 5개 fold의 voxel/location/presence 확률을 soft voting하고, 원본과 left-right
    flip 결과를 평균합니다. Flip 결과는 cache의 left/right label LUT로 원래 label에 복원합니다.
    Voxel location은 background를 제외한 52-class conditional softmax와 overlap consensus로
-   결정합니다. Task 1은 single-patch maximum 대신 aneurysm evidence로 gate한 top-k patch
-   평균을 사용해 한 noisy patch가 여러 location을 활성화하는 현상을 억제합니다.
+   결정합니다. Task 1은 유지된 aneurysm component의 위치 label에서 생성합니다.
 
 현재 radical baseline은 shared encoder 뒤에 vessel decoder와 aneurysm decoder를 분리합니다.
 Binary aneurysm loss는 Focal-Tversky + Dice + positive-weighted BCE를 사용하고, 52-class
@@ -316,6 +315,9 @@ python scripts/tune_presence_threshold.py \
 
 선택 결과와 전체 sweep은 같은 폴더의 `presence_threshold_sweep.json`에 저장됩니다. Test label로
 threshold를 고르면 leakage이므로 반드시 validation 또는 OOF 결과에만 사용합니다.
+Transformer 기반 patch-level location score를 별도로 진단하려면
+`--score-key task1_patch_location_scores`를 추가합니다. 이 결과는
+`patch_presence_threshold_sweep.json`으로 분리해 저장됩니다.
 
 ## 단일 volume 추론
 
