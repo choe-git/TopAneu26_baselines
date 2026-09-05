@@ -144,7 +144,9 @@ def run_epoch(
             objectness_values.append(float(objectness_loss.detach()))
             location_values.append(float(location_loss.detach()))
             targets.append(target.detach().cpu().numpy())
-            probabilities.append(probability.detach().cpu().numpy())
+            probabilities.append(
+                probability.detach().float().cpu().numpy()
+            )
             progress.set_postfix(loss=f"{total_values[-1]:.4f}")
     metrics = classification_metrics(
         np.concatenate(targets), np.concatenate(probabilities), threshold

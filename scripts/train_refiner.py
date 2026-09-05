@@ -147,7 +147,9 @@ def run_epoch(
                 optimizer.step()
             losses.append(float(loss.detach()))
             targets.append(target.detach().cpu().numpy())
-            probabilities.append(torch.sigmoid(logits).detach().cpu().numpy())
+            probabilities.append(
+                torch.sigmoid(logits).detach().float().cpu().numpy()
+            )
             progress.set_postfix(loss=f"{losses[-1]:.4f}")
     target_array = np.concatenate(targets)
     probability_array = np.concatenate(probabilities)
