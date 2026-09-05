@@ -370,6 +370,11 @@ def run_official_validation(
             component_location_weight=float(
                 settings.get("component_location_weight", 0.0)
             ),
+            sphere_threshold=float(settings.get("sphere_threshold", 0.5)),
+            sphere_support_threshold=float(
+                settings.get("sphere_support_threshold", 0.2)
+            ),
+            sphere_score_weight=float(settings.get("sphere_score_weight", 0.0)),
         )
         ground_truth, _ = load_zyx(
             location_mask_root / f"{case['case_id']}.nii.gz"

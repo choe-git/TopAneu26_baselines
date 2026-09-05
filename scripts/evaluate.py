@@ -92,11 +92,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-component-voxels", type=int, default=5)
     parser.add_argument("--maximum-components", type=int, default=5)
     parser.add_argument(
+        "--fold",
+        type=int,
+        help="With --checkpoint, evaluate only this held-out fold's development cases",
+    )
+    parser.add_argument(
         "--component-location-weight",
         type=float,
         default=0.0,
         help="Fuse categorical patch-head votes into component location labels",
     )
+    parser.add_argument("--sphere-threshold", type=float, default=0.5)
+    parser.add_argument("--sphere-support-threshold", type=float, default=0.2)
+    parser.add_argument("--sphere-score-weight", type=float, default=0.0)
     parser.add_argument(
         "--save-predictions", action=argparse.BooleanOptionalAction, default=True
     )
@@ -204,6 +212,10 @@ def main() -> None:
         raise ValueError("--oof requires --ensemble-folds")
     if args.oof and args.checkpoint is not None:
         raise ValueError("--oof cannot be combined with --checkpoint")
+    if args.fold is not None and args.checkpoint is None:
+        raise ValueError("--fold requires --checkpoint")
+    if args.fold is not None and args.oof:
+        raise ValueError("--fold cannot be combined with --oof")
     if args.oracle_vessel_refiner_fold is not None and not args.oof:
         raise ValueError("--oracle-vessel-refiner-fold is restricted to --oof")
     if args.ensemble_folds is not None:
@@ -263,20 +275,28 @@ def main() -> None:
     cache_index = load_cache_index(resolve_cache(layout))
     fold_to_model: dict[int, RNSASurrogate] = {}
     case_to_fold: dict[str, int] = {}
-    if args.oof:
+    if args.oof or args.fold is not None:
         fold_manifest = json.loads(layout.fold_manifest.read_text(encoding="utf-8"))
         case_to_fold = {
             str(case_id): int(fold)
             for case_id, fold in fold_manifest["case_to_fold"].items()
         }
-        assert args.ensemble_folds is not None
-        fold_to_model = dict(zip(args.ensemble_folds, models, strict=True))
-        cases = [
-            case
-            for case in cache_index["cases"]
-            if case_to_fold.get(str(case["case_id"])) in fold_to_model
-        ]
-        evaluation_split = "oof"
+        if args.oof:
+            assert args.ensemble_folds is not None
+            fold_to_model = dict(zip(args.ensemble_folds, models, strict=True))
+            cases = [
+                case
+                for case in cache_index["cases"]
+                if case_to_fold.get(str(case["case_id"])) in fold_to_model
+            ]
+            evaluation_split = "oof"
+        else:
+            cases = [
+                case
+                for case in cache_index["cases"]
+                if case_to_fold.get(str(case["case_id"])) == args.fold
+            ]
+            evaluation_split = f"fold_{args.fold}"
     else:
         cases = [case for case in cache_index["cases"] if case["split"] == args.split]
         evaluation_split = args.split
@@ -319,7 +339,7 @@ def main() -> None:
     for case in tqdm(cases, desc=f"Evaluating {evaluation_split}"):
         case_id = case["case_id"]
         case_fold = case_to_fold.get(str(case_id)) if args.oof else None
-        case_models = [fold_to_model[case_fold]] if case_fold is not None else models
+        case_models = [fold_to_model[case_fold]] if args.oof else models
         case_dir = cache_root / case["cache_dir"]
         image = np.load(case_dir / "image.npy", mmap_mode="r").astype(np.float32)
         cache_prediction, predicted_locations, inference_diagnostics = (
@@ -339,6 +359,9 @@ def main() -> None:
                 minimum_component_voxels=args.minimum_component_voxels,
                 maximum_components=args.maximum_components,
                 component_location_weight=args.component_location_weight,
+                sphere_threshold=args.sphere_threshold,
+                sphere_support_threshold=args.sphere_support_threshold,
+                sphere_score_weight=args.sphere_score_weight,
                 tta_left_right=args.tta_left_right,
                 location_lr_swap=cache_index["location_lr_swap"],
             )
@@ -450,6 +473,9 @@ def main() -> None:
             "minimum_component_voxels": args.minimum_component_voxels,
             "maximum_components": args.maximum_components,
             "component_location_weight": args.component_location_weight,
+            "sphere_threshold": args.sphere_threshold,
+            "sphere_support_threshold": args.sphere_support_threshold,
+            "sphere_score_weight": args.sphere_score_weight,
         },
         "inference": {
             "soft_voting_folds": args.ensemble_folds,
