@@ -14,6 +14,7 @@ from rnsa_surrogate.cache import normalize_angiography, resample_zyx, resize_to_
 from rnsa_surrogate.inference import sliding_window_predict
 from rnsa_surrogate.model import RNSASurrogate
 from rnsa_surrogate.run_layout import BaselineRunLayout
+from rnsa_surrogate.submission_contract import resolve_inference_amp
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,7 +83,18 @@ def main() -> None:
     )
     modality = args.modality or ("mr" if "_mr_" in args.image.name.lower() else "ct")
     amp_name = str(config["train"].get("amp", "none"))
-    amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "none": None}[amp_name]
+    bf16_supported = bool(
+        device.type == "cuda"
+        and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+    )
+    resolved_amp = resolve_inference_amp(amp_name, device.type, bf16_supported)
+    amp_dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "none": None,
+    }[resolved_amp]
+    if resolved_amp != amp_name:
+        print(f"AMP fallback: {amp_name} -> {resolved_amp} on {device}")
     segmentation, locations, _ = sliding_window_predict(
         model,
         image,

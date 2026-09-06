@@ -21,6 +21,10 @@ from rnsa_surrogate.refiner_data import manifest_records
 from rnsa_surrogate.roi_refiner import (
     CandidateROIRefinementDataset,
     CandidateROIRefiner,
+    VESSEL_CONTEXT_NONE,
+    VESSEL_CONTEXT_ORACLE,
+    VESSEL_CONTEXT_STAGE1,
+    validate_vessel_context_records,
 )
 from rnsa_surrogate.run_layout import BaselineRunLayout
 from rnsa_surrogate.runtime import (
@@ -50,6 +54,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--variant", default="roi_refiner")
     parser.add_argument("--candidate-variant", default="candidates")
     parser.add_argument("--vessel-context", action="store_true")
+    parser.add_argument(
+        "--oracle-organizer-vessel-context",
+        action="store_true",
+        help=(
+            "DIAGNOSTIC ONLY: permit cache/vessel.npy organizer ground truth. "
+            "The resulting checkpoint is marked nondeployable."
+        ),
+    )
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args()
 
@@ -193,6 +205,10 @@ def run_epoch(
 
 def main() -> None:
     args = parse_args()
+    if args.oracle_organizer_vessel_context and not args.vessel_context:
+        raise ValueError(
+            "--oracle-organizer-vessel-context requires --vessel-context"
+        )
     if not args.variant.replace("_", "").replace("-", "").isalnum():
         raise ValueError("--variant must be a simple directory name")
     if not args.candidate_variant.replace("_", "").replace("-", "").isalnum():
@@ -221,6 +237,29 @@ def main() -> None:
     val_records = manifest_records(manifests[args.fold])
     if {r["case_id"] for r in train_records} & {r["case_id"] for r in val_records}:
         raise AssertionError("ROI refiner train/validation case leakage")
+    vessel_context_source = VESSEL_CONTEXT_NONE
+    if args.vessel_context:
+        vessel_context_source = validate_vessel_context_records(
+            [*train_records, *val_records],
+            True,
+            allow_oracle=args.oracle_organizer_vessel_context,
+        )
+        for manifest in manifests:
+            declared = str(manifest.get("vessel_context_source", ""))
+            if vessel_context_source == VESSEL_CONTEXT_STAGE1:
+                if declared != VESSEL_CONTEXT_STAGE1:
+                    raise ValueError(
+                        f"Manifest {manifest['manifest_path']} does not explicitly "
+                        "declare vessel_context_source=stage1_prediction"
+                    )
+                if bool(manifest.get("organizer_vessel_input", False)):
+                    raise ValueError(
+                        f"Manifest {manifest['manifest_path']} used organizer vessel input"
+                    )
+            elif not args.oracle_organizer_vessel_context:
+                raise ValueError("Organizer vessel context requires explicit oracle mode")
+    organizer_vessel_input = vessel_context_source == VESSEL_CONTEXT_ORACLE
+    deployment_eligible = not organizer_vessel_input
     requested = args.device
     if requested == "auto":
         requested = "cuda" if torch.cuda.is_available() else "cpu"
@@ -233,10 +272,12 @@ def main() -> None:
     train_dataset = CandidateROIRefinementDataset(
         layout.cache, train_records, roi_size, augment=True, seed=seed,
         vessel_context=args.vessel_context,
+        allow_oracle_vessel_context=args.oracle_organizer_vessel_context,
     )
     val_dataset = CandidateROIRefinementDataset(
         layout.cache, val_records, roi_size, augment=False, seed=seed + 10_000_000,
         vessel_context=args.vessel_context,
+        allow_oracle_vessel_context=args.oracle_organizer_vessel_context,
     )
     sampler = BalancedCandidateSampler(
         train_dataset, int(settings.get("train_samples", 768)),
@@ -277,6 +318,15 @@ def main() -> None:
         "candidate_variant": args.candidate_variant,
         "vessel_context": args.vessel_context,
     }
+    # Keep the legacy no-vessel contract byte-for-byte compatible for resume.
+    # Vessel-enabled legacy checkpoints are intentionally rejected because
+    # their organizer-vs-prediction provenance cannot be proven.
+    if args.vessel_context:
+        contract.update(
+            vessel_context_source=vessel_context_source,
+            organizer_vessel_input=organizer_vessel_input,
+            deployment_eligible=deployment_eligible,
+        )
     contract_sha = config_digest(contract)
     output = layout.baseline / args.variant / "folds" / f"fold_{args.fold}"
     resume = args.resume.resolve() if args.resume else None
@@ -296,6 +346,9 @@ def main() -> None:
                 "candidate_manifest_sha256s": manifest_hashes,
                 "candidate_variant": args.candidate_variant,
                 "vessel_context": args.vessel_context,
+                "vessel_context_source": vessel_context_source,
+                "organizer_vessel_input": organizer_vessel_input,
+                "deployment_eligible": deployment_eligible,
                 "selection": "maximum fixed-threshold mean(candidate MCC, positive location accuracy, positive mask Dice)",
                 "contract_sha256": contract_sha,
             },
@@ -307,6 +360,14 @@ def main() -> None:
         checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
         if checkpoint.get("stage") != "roi_refiner" or checkpoint["contract_sha256"] != contract_sha:
             raise ValueError("ROI refiner resume contract differs")
+        if bool(checkpoint.get("vessel_context", False)) and (
+            checkpoint.get("vessel_context_source") != vessel_context_source
+            or bool(checkpoint.get("deployment_eligible", False))
+            != deployment_eligible
+        ):
+            raise ValueError(
+                "Vessel-enabled resume checkpoint has missing or incompatible provenance"
+            )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -315,6 +376,21 @@ def main() -> None:
     atomic_json_dump(
         {"stage": "roi_refiner", "parameters": sum(p.numel() for p in model.parameters()), "model": model_config},
         output / "model.json",
+    )
+    atomic_json_dump(
+        {
+            "stage": "roi_refiner",
+            "fold": args.fold,
+            "candidate_variant": args.candidate_variant,
+            "candidate_manifest_sha256s": manifest_hashes,
+            "cache_index_sha256": cache_sha,
+            "fold_manifest_sha256": fold_sha,
+            "vessel_context": args.vessel_context,
+            "vessel_context_source": vessel_context_source,
+            "organizer_vessel_input": organizer_vessel_input,
+            "deployment_eligible": deployment_eligible,
+        },
+        output / "provenance.json",
     )
     writer = SummaryWriter(
         layout.tensorboard / args.variant / "folds" / f"fold_{args.fold}",
@@ -338,6 +414,9 @@ def main() -> None:
                 "roi_size": list(roi_size), "settings": settings,
                 "candidate_variant": args.candidate_variant,
                 "vessel_context": args.vessel_context,
+                "vessel_context_source": vessel_context_source,
+                "organizer_vessel_input": organizer_vessel_input,
+                "deployment_eligible": deployment_eligible,
                 "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                 "best_validation_score": best_score, "contract_sha256": contract_sha,
                 "candidate_manifest_sha256s": manifest_hashes,

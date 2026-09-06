@@ -16,6 +16,61 @@ from .refiner_data import CandidateROIDataset
 from .refiner_model import RefinerBlock
 
 
+VESSEL_CONTEXT_NONE = "none"
+VESSEL_CONTEXT_STAGE1 = "stage1_prediction"
+VESSEL_CONTEXT_ORACLE = "organizer_ground_truth"
+
+
+def validate_vessel_context_records(
+    records: Sequence[dict[str, Any]],
+    enabled: bool,
+    *,
+    expected_source: str | None = None,
+    allow_oracle: bool = False,
+) -> str:
+    """Validate the provenance of every vessel-context input."""
+    if not enabled:
+        if expected_source not in (None, VESSEL_CONTEXT_NONE):
+            raise ValueError(
+                f"Vessel context is disabled but source is {expected_source!r}"
+            )
+        return VESSEL_CONTEXT_NONE
+    sources: set[str] = set()
+    for record in records:
+        source = str(record.get("vessel_context_source", ""))
+        if source == VESSEL_CONTEXT_STAGE1:
+            if not bool(record.get("vessel_context", False)):
+                raise ValueError(
+                    f"Candidate {record.get('candidate_id')} declares a Stage-1 "
+                    "vessel source but has no saved vessel context"
+                )
+            sources.add(source)
+        elif allow_oracle and source in (
+            "", VESSEL_CONTEXT_NONE, VESSEL_CONTEXT_ORACLE
+        ):
+            sources.add(VESSEL_CONTEXT_ORACLE)
+        else:
+            raise ValueError(
+                f"Candidate {record.get('candidate_id')} has unsafe or unspecified "
+                f"vessel_context_source={source!r}; regenerate candidates with "
+                "--with-vessel-context, or use the explicit oracle diagnostic flag"
+            )
+    if not sources:
+        source = expected_source or (
+            VESSEL_CONTEXT_ORACLE if allow_oracle else VESSEL_CONTEXT_STAGE1
+        )
+    elif len(sources) == 1:
+        source = next(iter(sources))
+    else:
+        raise ValueError(f"Mixed vessel-context sources are forbidden: {sorted(sources)}")
+    if expected_source is not None and source != expected_source:
+        raise ValueError(
+            f"Vessel-context source mismatch: records={source!r}, "
+            f"expected={expected_source!r}"
+        )
+    return source
+
+
 @lru_cache(maxsize=8)
 def _cached_instances(cache_root: str, cache_directory: str) -> np.ndarray:
     return np.load(
@@ -41,9 +96,21 @@ def roi_start(record: dict[str, Any], roi_size: Sequence[int]) -> tuple[int, int
 class CandidateROIRefinementDataset(CandidateROIDataset):
     """Adds the GT instance matched by a stage-1 component as a dense target."""
 
-    def __init__(self, *args: Any, vessel_context: bool = False, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        vessel_context: bool = False,
+        allow_oracle_vessel_context: bool = False,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.vessel_context = bool(vessel_context)
+        self.allow_oracle_vessel_context = bool(allow_oracle_vessel_context)
+        validate_vessel_context_records(
+            self.records,
+            self.vessel_context,
+            allow_oracle=self.allow_oracle_vessel_context,
+        )
 
     def __getitem__(self, item: int) -> dict[str, torch.Tensor]:
         sample = super().__getitem__(item)
@@ -88,11 +155,14 @@ class CandidateROIRefinementDataset(CandidateROIDataset):
             target = np.flip(target, axis=-1).copy()
             valid = np.flip(valid, axis=-1).copy()
         if self.vessel_context:
-            if record.get("vessel_context"):
+            source = str(record.get("vessel_context_source", ""))
+            if source == VESSEL_CONTEXT_STAGE1:
                 vessel = candidate_vessel_roi(
                     record["_artifact_path"], int(record["artifact_index"])
                 )
-            else:
+            elif self.allow_oracle_vessel_context and source in (
+                "", VESSEL_CONTEXT_NONE, VESSEL_CONTEXT_ORACLE
+            ):
                 vessel_volume = _cached_vessel(
                     self.cache_root, str(case["cache_dir"])
                 )
@@ -101,6 +171,11 @@ class CandidateROIRefinementDataset(CandidateROIDataset):
                     tuple(int(round(float(value))) for value in record["center_zyx"]),
                     self.roi_size,
                     pad_value=0,
+                )
+            else:
+                raise ValueError(
+                    f"Unsafe vessel_context_source={source!r} for "
+                    f"{record.get('candidate_id')}"
                 )
             if vessel.shape != self.roi_size:
                 raise ValueError(

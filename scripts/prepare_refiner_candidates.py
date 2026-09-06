@@ -259,6 +259,9 @@ def main() -> None:
                 record["artifact"] = artifact.as_posix()
                 record["generator_fold"] = fold
                 record["vessel_context"] = bool(args.with_vessel_context)
+                record["vessel_context_source"] = (
+                    "stage1_prediction" if args.with_vessel_context else "none"
+                )
                 if int(record["generator_fold"]) != int(
                     fold_manifest["case_to_fold"][case_id]
                 ):
@@ -286,6 +289,10 @@ def main() -> None:
             "inference": inference_settings,
             "candidate_variant": args.candidate_variant,
             "vessel_context": bool(args.with_vessel_context),
+            "vessel_context_source": (
+                "stage1_prediction" if args.with_vessel_context else "none"
+            ),
+            "organizer_vessel_input": False,
             "vessel_roi_size": list(args.vessel_roi_size),
             "inference_sha256": config_digest(inference_settings),
             "leakage_guard": (
