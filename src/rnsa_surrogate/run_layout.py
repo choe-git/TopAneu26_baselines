@@ -23,6 +23,14 @@ def validate_run_root(path: str | Path) -> Path:
     return root
 
 
+def validate_variant_name(value: str, option: str) -> str:
+    """Validate a user-selected artifact directory without allowing traversal."""
+    value = str(value)
+    if not value or not value.replace("_", "").replace("-", "").isalnum():
+        raise ValueError(f"{option} must be a simple directory name")
+    return value
+
+
 @dataclass(frozen=True)
 class BaselineRunLayout:
     """Resolve every pipeline artifact below one timestamped RUN_DIR."""
@@ -69,9 +77,19 @@ class BaselineRunLayout:
     def refiner_candidates(self) -> Path:
         return self.refiner / "candidates"
 
+    def refiner_candidates_for(self, variant: str = "candidates") -> Path:
+        return self.refiner / validate_variant_name(variant, "candidate variant")
+
     @property
     def refiner_folds(self) -> Path:
         return self.refiner / "folds"
+
+    def refiner_folds_for(self, variant: str = "refiner") -> Path:
+        return (
+            self.baseline
+            / validate_variant_name(variant, "refiner variant")
+            / "folds"
+        )
 
     @property
     def refiner_location(self) -> Path:
@@ -96,6 +114,14 @@ class BaselineRunLayout:
     @property
     def refiner_tensorboard(self) -> Path:
         return self.tensorboard / "refiner"
+
+    def refiner_tensorboard_for(self, variant: str = "refiner") -> Path:
+        return self.tensorboard / validate_variant_name(variant, "refiner variant")
+
+    def refiner_evaluation_for(self, variant: str = "refiner") -> Path:
+        variant = validate_variant_name(variant, "refiner variant")
+        name = "oof_refined" if variant == "refiner" else f"oof_refined_{variant}"
+        return self.ensemble / "evaluation" / name
 
     @property
     def refiner_location_tensorboard(self) -> Path:

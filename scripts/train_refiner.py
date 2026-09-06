@@ -86,6 +86,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("cuda", "cpu", "auto"), default="cuda")
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument(
+        "--candidate-variant",
+        default="candidates",
+        help="Read OOF manifests from baseline/refiner/NAME",
+    )
+    parser.add_argument(
+        "--refiner-variant",
+        default="refiner",
+        help="Write checkpoints below baseline/NAME and TensorBoard below NAME",
+    )
     return parser.parse_args()
 
 
@@ -175,6 +185,9 @@ def run_epoch(
 def main() -> None:
     args = parse_args()
     layout = BaselineRunLayout.from_root(args.run_dir)
+    candidate_root = layout.refiner_candidates_for(args.candidate_variant)
+    refiner_folds = layout.refiner_folds_for(args.refiner_variant)
+    refiner_tensorboard = layout.refiner_tensorboard_for(args.refiner_variant)
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     settings = dict(config.get("refiner", {}))
     if args.smoke_test:
@@ -191,8 +204,14 @@ def main() -> None:
 
     manifests = []
     for fold in range(int(fold_manifest["n_folds"])):
-        path = layout.refiner_candidates / "oof" / f"fold_{fold}" / "manifest.json"
+        path = candidate_root / "oof" / f"fold_{fold}" / "manifest.json"
         manifest = load_candidate_manifest(path)
+        manifest_variant = str(manifest.get("candidate_variant", "candidates"))
+        if manifest_variant != args.candidate_variant:
+            raise ValueError(
+                f"Candidate variant mismatch: requested {args.candidate_variant}, "
+                f"manifest records {manifest_variant}: {path}"
+            )
         if int(manifest["fold"]) != fold:
             raise ValueError(f"Candidate manifest fold mismatch: {path}")
         if manifest["cache_index_sha256"] != cache_sha:
@@ -284,9 +303,13 @@ def main() -> None:
         "fold_manifest_sha256": fold_sha,
         "candidate_manifest_sha256s": manifest_hashes,
     }
+    # Preserve the exact legacy resume contract for the canonical defaults.
+    if args.candidate_variant != "candidates" or args.refiner_variant != "refiner":
+        contract["candidate_variant"] = args.candidate_variant
+        contract["refiner_variant"] = args.refiner_variant
     contract_sha = config_digest(contract)
-    output = layout.refiner_folds / f"fold_{args.fold}"
-    tensorboard = layout.refiner_tensorboard / "folds" / f"fold_{args.fold}"
+    output = refiner_folds / f"fold_{args.fold}"
+    tensorboard = refiner_tensorboard / "folds" / f"fold_{args.fold}"
     resume = args.resume.resolve() if args.resume is not None else None
     start_epoch, best_score = 0, float("-inf")
     if resume is None:
@@ -307,6 +330,8 @@ def main() -> None:
                 "train_candidates": len(train_records),
                 "validation_candidates": len(val_records),
                 "candidate_manifest_sha256s": manifest_hashes,
+                "candidate_variant": args.candidate_variant,
+                "refiner_variant": args.refiner_variant,
                 "cache_index": cache_index["index_path"],
                 "cache_index_sha256": cache_sha,
                 "fold_manifest": str(fold_manifest_path),
@@ -321,6 +346,10 @@ def main() -> None:
         checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
         if checkpoint.get("stage") != "objectness_refiner":
             raise ValueError(f"Not a refiner checkpoint: {resume}")
+        if checkpoint.get("candidate_variant", "candidates") != args.candidate_variant:
+            raise ValueError("Resume checkpoint candidate variant differs")
+        if checkpoint.get("refiner_variant", "refiner") != args.refiner_variant:
+            raise ValueError("Resume checkpoint refiner variant differs")
         if checkpoint["contract_sha256"] != contract_sha:
             raise ValueError("Refiner resume contract differs")
         model.load_state_dict(checkpoint["model"])
@@ -342,6 +371,8 @@ def main() -> None:
             "cache_index_sha256": cache_sha,
             "fold_manifest_sha256": fold_sha,
             "candidate_manifest_sha256s": manifest_hashes,
+            "candidate_variant": args.candidate_variant,
+            "refiner_variant": args.refiner_variant,
             "organizer_vessel_input": False,
         },
         output / "provenance.json",
@@ -376,6 +407,8 @@ def main() -> None:
                 "selection_threshold": selected_threshold,
                 "contract_sha256": contract_sha,
                 "candidate_manifest_sha256s": manifest_hashes,
+                "candidate_variant": args.candidate_variant,
+                "refiner_variant": args.refiner_variant,
                 "cache_index_sha256": cache_sha,
                 "fold_manifest_sha256": fold_sha,
                 "rng": rng_state(),

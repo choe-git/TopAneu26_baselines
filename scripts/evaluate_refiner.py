@@ -49,6 +49,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--folds", type=int, nargs="+")
     parser.add_argument("--device", choices=("cuda", "cpu", "auto"), default="cuda")
     parser.add_argument("--threshold", type=float)
+    parser.add_argument(
+        "--candidate-variant",
+        default="candidates",
+        help="Read OOF manifests from baseline/refiner/NAME",
+    )
+    parser.add_argument(
+        "--refiner-variant",
+        default="refiner",
+        help="Read checkpoints below baseline/NAME and isolate default output",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
@@ -127,9 +137,11 @@ def predict_records(
 def main() -> None:
     args = parse_args()
     layout = BaselineRunLayout.from_root(args.run_dir)
+    candidate_root = layout.refiner_candidates_for(args.candidate_variant)
+    refiner_folds = layout.refiner_folds_for(args.refiner_variant)
     output = (
         args.output
-        or layout.ensemble / "evaluation" / "oof_refined"
+        or layout.refiner_evaluation_for(args.refiner_variant)
     ).resolve()
     metrics_path = output / "metrics.json"
     if metrics_path.exists() and not args.overwrite:
@@ -159,9 +171,15 @@ def main() -> None:
     threshold_by_fold: dict[int, float] = {}
     for fold in selected:
         manifest_path = (
-            layout.refiner_candidates / "oof" / f"fold_{fold}" / "manifest.json"
+            candidate_root / "oof" / f"fold_{fold}" / "manifest.json"
         )
         manifest = load_candidate_manifest(manifest_path)
+        manifest_variant = str(manifest.get("candidate_variant", "candidates"))
+        if manifest_variant != args.candidate_variant:
+            raise ValueError(
+                f"Candidate variant mismatch: requested {args.candidate_variant}, "
+                f"manifest records {manifest_variant}: {manifest_path}"
+            )
         if int(manifest["fold"]) != fold:
             raise ValueError(f"Candidate manifest fold mismatch: {manifest_path}")
         if manifest["cache_index_sha256"] != cache_sha:
@@ -180,7 +198,7 @@ def main() -> None:
                 raise ValueError(f"Leaked candidate generator for {case_id}")
             records_by_case.setdefault(case_id, []).append(record)
         checkpoint_path = (
-            layout.refiner_folds / f"fold_{fold}" / "checkpoint_best.pth"
+            refiner_folds / f"fold_{fold}" / "checkpoint_best.pth"
         ).resolve()
         checkpoint = torch.load(
             checkpoint_path, map_location="cpu", weights_only=False
@@ -189,10 +207,29 @@ def main() -> None:
             raise ValueError(f"Not a refiner checkpoint: {checkpoint_path}")
         if int(checkpoint.get("fold", -1)) != fold:
             raise ValueError(f"Refiner checkpoint fold mismatch: {checkpoint_path}")
+        if checkpoint.get("candidate_variant", "candidates") != args.candidate_variant:
+            raise ValueError(
+                f"Refiner checkpoint candidate variant mismatch: {checkpoint_path}"
+            )
+        if checkpoint.get("refiner_variant", "refiner") != args.refiner_variant:
+            raise ValueError(
+                f"Refiner checkpoint output variant mismatch: {checkpoint_path}"
+            )
         if checkpoint["cache_index_sha256"] != cache_sha:
             raise ValueError(f"Refiner checkpoint cache mismatch: {checkpoint_path}")
         if checkpoint["fold_manifest_sha256"] != fold_sha:
             raise ValueError(f"Refiner checkpoint fold provenance mismatch")
+        actual_manifest_sha = sha256_file(manifest_path)
+        expected_manifest_sha = checkpoint.get(
+            "candidate_manifest_sha256s", {}
+        ).get(str(fold))
+        if (
+            expected_manifest_sha is not None
+            and expected_manifest_sha != actual_manifest_sha
+        ):
+            raise ValueError(
+                f"Refiner checkpoint candidate provenance mismatch: {manifest_path}"
+            )
         model = CandidateObjectnessRefiner(**checkpoint["model_config"])
         model.load_state_dict(checkpoint["model"])
         model.to(device)
@@ -214,7 +251,7 @@ def main() -> None:
         checkpoint_paths.append(str(checkpoint_path))
         checkpoint_hashes.append(sha256_file(checkpoint_path))
         manifest_paths.append(str(manifest_path.resolve()))
-        manifest_hashes.append(sha256_file(manifest_path))
+        manifest_hashes.append(actual_manifest_sha)
 
     selected_case_ids = {
         str(case_id)
@@ -306,6 +343,8 @@ def main() -> None:
         "split": "oof",
         "cases": len(selected_case_ids),
         "mode": "stage1_oof_plus_heldout_objectness_refiner",
+        "candidate_variant": args.candidate_variant,
+        "refiner_variant": args.refiner_variant,
         "folds": selected,
         "checkpoints": checkpoint_paths,
         "checkpoint_sha256s": checkpoint_hashes,
