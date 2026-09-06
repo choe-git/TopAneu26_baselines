@@ -42,6 +42,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-components", type=int)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--candidate-variant", default="candidates")
+    parser.add_argument(
+        "--stage1-variant",
+        help="Read fold checkpoints from baseline/variants/NAME instead of canonical folds",
+    )
+    parser.add_argument("--sphere-threshold", type=float)
+    parser.add_argument("--sphere-support-threshold", type=float)
+    parser.add_argument("--sphere-score-weight", type=float)
     parser.add_argument("--with-vessel-context", action="store_true")
     parser.add_argument("--vessel-roi-size", type=int, nargs=3, default=[48, 64, 64])
     return parser.parse_args()
@@ -76,6 +83,8 @@ def main() -> None:
     args = parse_args()
     if not args.candidate_variant.replace("_", "").replace("-", "").isalnum():
         raise ValueError("--candidate-variant must be a simple directory name")
+    if args.stage1_variant and not args.stage1_variant.replace("_", "").replace("-", "").isalnum():
+        raise ValueError("--stage1-variant must be a simple directory name")
     layout = BaselineRunLayout.from_root(args.run_dir)
     cache_index = load_cache_index(layout.cache)
     cache_sha = sha256_file(cache_index["index_path"])
@@ -96,8 +105,12 @@ def main() -> None:
     for fold in selected:
         if not 0 <= fold < int(fold_manifest["n_folds"]):
             raise ValueError(f"Invalid fold: {fold}")
+        checkpoint_root = (
+            layout.baseline / "variants" / args.stage1_variant / "folds"
+            if args.stage1_variant else layout.folds
+        )
         checkpoint_path = (
-            layout.folds / f"fold_{fold}" / "checkpoint_best.pth"
+            checkpoint_root / f"fold_{fold}" / "checkpoint_best.pth"
         ).resolve()
         model, config, checkpoint = load_stage1(checkpoint_path, fold, device)
         if checkpoint.get("cache_index_sha256") != cache_sha:
@@ -131,6 +144,11 @@ def main() -> None:
             "component_location_weight": float(
                 settings.get("component_location_weight", 0.0)
             ),
+            "sphere_threshold": float(settings.get("sphere_threshold", 0.5)),
+            "sphere_support_threshold": float(
+                settings.get("sphere_support_threshold", 0.2)
+            ),
+            "sphere_score_weight": float(settings.get("sphere_score_weight", 0.0)),
             "tta_left_right": bool(args.tta_left_right),
         }
         if args.mask_threshold is not None:
@@ -147,6 +165,14 @@ def main() -> None:
             inference_settings["maximum_components"] = int(
                 args.maximum_components
             )
+        if args.sphere_threshold is not None:
+            inference_settings["sphere_threshold"] = float(args.sphere_threshold)
+        if args.sphere_support_threshold is not None:
+            inference_settings["sphere_support_threshold"] = float(
+                args.sphere_support_threshold
+            )
+        if args.sphere_score_weight is not None:
+            inference_settings["sphere_score_weight"] = float(args.sphere_score_weight)
         if not 0.0 < inference_settings["mask_threshold"] < 1.0:
             raise ValueError("mask_threshold must be between zero and one")
         if not 0.0 < inference_settings["presence_threshold"] < 1.0:
@@ -155,6 +181,12 @@ def main() -> None:
             raise ValueError("minimum_component_voxels must be positive")
         if inference_settings["maximum_components"] < 1:
             raise ValueError("maximum_components must be positive")
+        if not 0.0 <= inference_settings["sphere_score_weight"] <= 1.0:
+            raise ValueError("sphere_score_weight must be in [0, 1]")
+        if not 0.0 < inference_settings["sphere_threshold"] < 1.0:
+            raise ValueError("sphere_threshold must be between zero and one")
+        if not 0.0 <= inference_settings["sphere_support_threshold"] <= inference_settings["mask_threshold"]:
+            raise ValueError("sphere_support_threshold must be in [0, mask_threshold]")
         amp_name = str(config["train"].get("amp", "none"))
         amp_dtype = {
             "bf16": torch.bfloat16,
@@ -192,6 +224,11 @@ def main() -> None:
                 component_location_weight=inference_settings[
                     "component_location_weight"
                 ],
+                sphere_threshold=inference_settings["sphere_threshold"],
+                sphere_support_threshold=inference_settings[
+                    "sphere_support_threshold"
+                ],
+                sphere_score_weight=inference_settings["sphere_score_weight"],
                 tta_left_right=args.tta_left_right,
                 location_lr_swap=cache_index["location_lr_swap"],
                 return_vessel_segmentation=args.with_vessel_context,
@@ -245,6 +282,7 @@ def main() -> None:
             "stage1_checkpoint": str(checkpoint_path),
             "stage1_checkpoint_sha256": sha256_file(checkpoint_path),
             "stage1_checkpoint_epoch": int(checkpoint["epoch"]),
+            "stage1_variant": args.stage1_variant,
             "inference": inference_settings,
             "candidate_variant": args.candidate_variant,
             "vessel_context": bool(args.with_vessel_context),
